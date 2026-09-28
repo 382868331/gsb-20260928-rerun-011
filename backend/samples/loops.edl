@@ -1,0 +1,11 @@
+fun sum_to(limit)
+    total = 0
+    i = 1
+    while i <= limit
+        total = total + i
+        i = i + 1
+    return total
+
+fun main()
+    answer = sum_to(5)
+    print("sum 1..5 =", answer)

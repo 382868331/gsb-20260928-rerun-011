@@ -1,0 +1,8 @@
+fun divide(a, b)
+    return a / b
+
+fun main()
+    x = 10
+    y = 0
+    z = divide(x, y)
+    print(z)
