@@ -189,7 +189,11 @@ class RuntimeEngine:
                 raise RuntimeError_("未知语句", stmt.line)
         finally:
             self._stmt_level -= 1
-            self._emit({"kind": "stmt_end", "line": stmt.line})
+            self._emit({
+                "kind": "stmt_end",
+                "line": stmt.line,
+                "level": self._stmt_level + 1,
+            })
 
     # ---- expressions ----
 
