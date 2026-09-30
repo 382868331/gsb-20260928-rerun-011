@@ -110,6 +110,123 @@ def test_source_change_invalidates_breakpoints_and_resets():
     assert result["changed"] == False
 
 
+def test_failed_source_update_preserves_complete_old_session():
+    s = DebugSession(RECURSIVE)
+    s.set_breakpoints([2])
+    s.continue_()
+    s.continue_()
+    paused = s.state()
+
+    with pytest.raises(SourceError):
+        s.update_source("fun broken(\n")
+    with pytest.raises(SourceError):
+        s.update_source("let = oops\n")
+
+    preserved = s.state()
+    assert preserved["source"] == RECURSIVE
+    assert preserved["breakpoints"] == [2]
+    assert preserved["line"] == paused["line"]
+    assert preserved["stack"] == paused["stack"]
+    assert locals_of(preserved) == locals_of(paused)
+    s.continue_()
+    assert s.state()["line"] == 2
+    assert locals_of(s.state())["n"] == "1"
+
+
+def test_source_preview_does_not_mutate_session():
+    s = DebugSession(LOOP)
+    s.set_breakpoints([4])
+    s.continue_()
+    paused = s.state()
+
+    preview = s.preview_source_update("print(1)\nprint(2)\n")
+    assert preview["changed"] is True
+    assert s.state() == paused
+
+    with pytest.raises(SourceError):
+        s.preview_source_update("fun broken(\n")
+    assert s.state() == paused
+
+
+def test_rewrite_preview_marks_retained_and_reconfirmed_breakpoints():
+    rewritten = """let i = 0
+let total = 0
+print(0)
+while i < 5
+    total = total + i
+    i = i + 1
+print(total)
+"""
+    s = DebugSession(LOOP)
+    s.set_breakpoints([4, 5])
+
+    preview = s.preview_source_update(rewritten)
+    assert preview["retained_breakpoints"] == [
+        {"from": 4, "to": 5, "text": "total = total + i"},
+        {"from": 5, "to": 6, "text": "i = i + 1"},
+    ]
+    assert preview["reconfirm_breakpoints"] == []
+
+    ambiguous = "print(total)\nprint(total)\n"
+    preview = s.preview_source_update(ambiguous)
+    assert preview["retained_breakpoints"] == []
+    assert [item["from"] for item in preview["reconfirm_breakpoints"]] == [4, 5]
+
+
+def test_commit_uses_only_confirmed_breakpoints():
+    rewritten = """let i = 0
+let total = 0
+print(0)
+while i < 5
+    total = total + i
+    i = i + 1
+print(total)
+"""
+    s = DebugSession(LOOP)
+    s.set_breakpoints([4, 5])
+    s.continue_()
+
+    result = s.commit_source_update(rewritten, [5])
+    assert result["changed"] is True
+    assert s.state()["line"] is None
+    assert s.state()["breakpoints"] == [5]
+    s.continue_()
+    assert s.state()["line"] == 5
+
+
+def test_commit_marks_manually_reconfirmed_breakpoint_as_migrated():
+    s = DebugSession(LOOP)
+    s.set_breakpoints([6])
+    new_source = "print(1)\nprint(2)\n"
+    preview = s.preview_source_update(new_source)
+    candidate = preview["reconfirm_breakpoints"][0]["candidates"][0]
+
+    result = s.commit_source_update(new_source, [candidate])
+    assert result["invalidated_breakpoints"] == []
+    assert result["migrated_breakpoints"] == [
+        {"from": 6, "to": candidate, "text": "print(total)"}
+    ]
+    assert s.state()["breakpoints"] == [candidate]
+
+
+def test_saved_old_session_can_still_switch_after_reopen(tmp_path):
+    store = SessionStore(directory=tmp_path)
+    created = store.create(RECURSIVE)
+    created.set_breakpoints([2])
+    created.continue_()
+    store.touch(created)
+
+    reopened = SessionStore(directory=tmp_path).get(created.id)
+    assert reopened.state()["stack"]
+    with pytest.raises(SourceError):
+        reopened.update_source("let = bad\n")
+    assert reopened.state()["stack"] == created.state()["stack"]
+    reopened.commit_source_update(LOOP)
+    assert reopened.state()["line"] is None
+    assert reopened.state()["stack"] == []
+    assert reopened.state()["source"] == LOOP
+
+
 def test_save_and_reopen_restores_pause(tmp_path):
     store = SessionStore(directory=tmp_path)
     s = store.create(RECURSIVE)

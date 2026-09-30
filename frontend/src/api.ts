@@ -28,6 +28,27 @@ export interface SessionState {
   error: { line: number; message: string; stack: FrameSnapshot[] } | null;
   sourceChanged?: boolean;
   invalidatedBreakpoints?: number[];
+  migratedBreakpoints?: BreakpointMigration[];
+}
+
+export interface BreakpointMigration {
+  from: number;
+  to: number;
+  text: string;
+}
+
+export interface ReconfirmBreakpoint {
+  from: number;
+  text: string;
+  candidates: number[];
+}
+
+export interface SourcePreview {
+  changed: boolean;
+  source: string;
+  source_hash: string;
+  retained_breakpoints: BreakpointMigration[];
+  reconfirm_breakpoints: ReconfirmBreakpoint[];
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -67,5 +88,15 @@ export const api = {
     request<SessionState>(`/api/sessions/${id}/source`, {
       method: "PUT",
       body: JSON.stringify({ source }),
+    }),
+  previewSourceUpdate: (id: string, source: string) =>
+    request<SourcePreview>(`/api/sessions/${id}/source/preview`, {
+      method: "POST",
+      body: JSON.stringify({ source }),
+    }),
+  commitSourceUpdate: (id: string, source: string, breakpoints: number[]) =>
+    request<SessionState>(`/api/sessions/${id}/source/commit`, {
+      method: "POST",
+      body: JSON.stringify({ source, breakpoints }),
     }),
 };

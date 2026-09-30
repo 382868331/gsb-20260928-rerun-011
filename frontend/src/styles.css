@@ -28,6 +28,21 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 .banner.notice { background: #1e3a4a; color: #7fd4ff; }
 .banner.error { background: #4a1e1e; color: #ff8a8a; }
+.migration {
+  display: flex; gap: 16px; align-items: flex-start;
+  padding: 10px 16px; background: #1e334a; color: #d7ecff;
+  border-bottom: 1px solid #35536e; font-size: 13px;
+}
+.migration-title { font-weight: 600; white-space: nowrap; padding-top: 4px; }
+.migration-list { display: flex; gap: 18px; flex: 1; flex-wrap: wrap; }
+.migration-group { display: flex; flex-direction: column; gap: 5px; min-width: 260px; }
+.migration-group.warn { color: #ffd479; }
+.migration-group label { display: flex; gap: 8px; align-items: center; }
+.migration-group select {
+  background: #26272e; color: #e6e6e6; border: 1px solid #4a4d58;
+  border-radius: 4px; padding: 3px 6px;
+}
+.migration-actions { display: flex; gap: 8px; }
 main { flex: 1; display: flex; min-height: 0; }
 .editor { flex: 1; padding: 12px; overflow: auto; }
 .editor-inner {

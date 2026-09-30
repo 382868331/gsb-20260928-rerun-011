@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 import uuid
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from .minilang import Lexer, Parser, RuntimeEngine
@@ -55,20 +56,142 @@ class DebugSession:
         self.source_hash = source_hash(source)
         self.cursor = -1
 
-    def update_source(self, source: str) -> dict:
-        """Load a new program into this session.
-
-        Old breakpoints belong to the old line numbering and are never
-        silently carried over: they are explicitly invalidated and
-        reported back to the caller. The old execution position is
-        discarded because the old trace no longer applies.
-        """
+    def preview_source_update(self, source: str) -> dict:
+        """Validate and preview a source update without mutating the session."""
         if source_hash(source) == self.source_hash:
-            return {"changed": False, "invalidated_breakpoints": []}
-        invalidated = sorted(self.breakpoints)
-        self.breakpoints = set()
-        self._load_source(source)
-        return {"changed": True, "invalidated_breakpoints": invalidated}
+            return {
+                "changed": False,
+                "source": source,
+                "source_hash": self.source_hash,
+                "retained_breakpoints": [],
+                "reconfirm_breakpoints": [],
+            }
+
+        # Compilation is the acceptance gate. Doing this before touching any
+        # session field means a lex/parse failure leaves the old trace, cursor
+        # and breakpoints intact.
+        program = compile_source(source)
+        candidate_events = RuntimeEngine(program).run()
+        executable_lines = {
+            event["line"]
+            for event in candidate_events
+            if event["kind"] == "line" and event.get("line") is not None
+        }
+        old_lines = self.source.splitlines()
+        new_lines = source.splitlines()
+        equal_map = {}
+        matcher = SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+        for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+            if tag != "equal":
+                continue
+            for offset in range(old_end - old_start):
+                equal_map[old_start + offset + 1] = new_start + offset + 1
+        new_occurrences: dict[str, list[int]] = {}
+        for index, line in enumerate(new_lines, start=1):
+            text = line.strip()
+            if text:
+                new_occurrences.setdefault(text, []).append(index)
+
+        retained = []
+        reconfirm = []
+        for old_line in sorted(self.breakpoints):
+            text = old_lines[old_line - 1].strip() if 0 < old_line <= len(old_lines) else ""
+            aligned_line = equal_map.get(old_line)
+            matches = new_occurrences.get(text, []) if text else []
+            executable_matches = [line for line in matches if line in executable_lines]
+            if aligned_line in executable_lines:
+                target_line = aligned_line
+            elif len(executable_matches) == 1:
+                target_line = executable_matches[0]
+            else:
+                target_line = None
+            if target_line is not None:
+                retained.append({
+                    "from": old_line,
+                    "to": target_line,
+                    "text": text,
+                })
+            else:
+                reconfirm.append({
+                    "from": old_line,
+                    "text": text,
+                    "candidates": self._nearby_candidates(
+                        old_line, len(new_lines), executable_lines
+                    ),
+                })
+
+        return {
+            "changed": True,
+            "source": source,
+            "source_hash": source_hash(source),
+            "retained_breakpoints": retained,
+            "reconfirm_breakpoints": reconfirm,
+        }
+
+    @staticmethod
+    def _nearby_candidates(
+        old_line: int, new_line_count: int, executable_lines: set[int]
+    ) -> list[int]:
+        if not executable_lines:
+            return []
+        target = max(1, min(old_line, new_line_count))
+        return sorted(executable_lines, key=lambda line: (abs(line - target), line))[:3]
+
+    def commit_source_update(self, source: str, breakpoints: list[int] | None = None) -> dict:
+        """Atomically accept a validated program and its chosen breakpoints."""
+        preview = self.preview_source_update(source)
+        if not preview["changed"]:
+            return {
+                "changed": False,
+                "invalidated_breakpoints": [],
+                "migrated_breakpoints": [],
+                "reconfirm_breakpoints": [],
+            }
+
+        if breakpoints is None:
+            selected_lines = {item["to"] for item in preview["retained_breakpoints"]}
+        else:
+            selected_lines = {
+                line for line in breakpoints if isinstance(line, int) and line > 0
+            }
+
+        retained = preview["retained_breakpoints"]
+        chosen_reconfirm = []
+        invalidated = []
+        for item in preview["reconfirm_breakpoints"]:
+            chosen_line = next(
+                (line for line in item["candidates"] if line in selected_lines), None
+            )
+            if chosen_line is None:
+                invalidated.append(item["from"])
+            else:
+                chosen_reconfirm.append({
+                    "from": item["from"],
+                    "to": chosen_line,
+                    "text": item["text"],
+                })
+
+        # Keep the previous trace in locals until the new trace is ready. If
+        # compilation unexpectedly fails, assignment never starts.
+        program = compile_source(source)
+        engine = RuntimeEngine(program)
+        events = engine.run()
+        self.events = events
+        self.source = source
+        self.source_hash = preview["source_hash"]
+        self.cursor = -1
+        self.breakpoints = selected_lines
+
+        return {
+            "changed": True,
+            "invalidated_breakpoints": invalidated,
+            "migrated_breakpoints": retained + chosen_reconfirm,
+            "reconfirm_breakpoints": invalidated,
+        }
+
+    def update_source(self, source: str) -> dict:
+        """Backward-compatible wrapper used by the immediate-commit API."""
+        return self.commit_source_update(source)
 
     # ---- breakpoints ----
 
