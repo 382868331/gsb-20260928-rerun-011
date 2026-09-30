@@ -29,6 +29,21 @@ def compile_source(source: str):
         raise SourceError(str(exc)) from exc
 
 
+def _executable_lines(events: list[dict]) -> set[int]:
+    """Lines that can host a pause in a recorded trace (1-based)."""
+    return {evt["line"] for evt in events if evt["kind"] == "line"}
+
+
+def _line_text(lines: list[str], line_number: int) -> str:
+    if 1 <= line_number <= len(lines):
+        return lines[line_number - 1].strip()
+    return ""
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.split())
+
+
 class DebugSession:
     """A replay-based debug session over the recorded event trace.
 
@@ -43,32 +58,95 @@ class DebugSession:
         self.created_at = time.time()
         self.breakpoints: set[int] = set()
         self.cursor = -1
-        self._load_source(source)
+        _, self.events = self._build_trace(source)
+        self.source = source
+        self.source_hash = source_hash(source)
 
     # ---- source / trace ----
 
-    def _load_source(self, source: str) -> None:
+    @staticmethod
+    def _build_trace(source: str):
+        """Compile and run ``source`` without touching any session state.
+
+        Raises ``SourceError`` if the program cannot be parsed, so callers
+        can reject an edit before the live session is modified in any way.
+        """
         program = compile_source(source)
-        engine = RuntimeEngine(program)
-        self.events = engine.run()
+        events = RuntimeEngine(program).run()
+        return program, events
+
+    def preview_source_change(self, source: str) -> dict:
+        """Preview a source switch without mutating the session.
+
+        The candidate program is compiled in full first; a lex/parse
+        failure raises ``SourceError`` and leaves breakpoints, cursor and
+        stack snapshots exactly as they were. When compilation succeeds,
+        each old breakpoint is mapped onto the new line numbering and
+        classified as directly reusable or as needing reconfirmation.
+        """
+        if source_hash(source) == self.source_hash:
+            return {"changed": False, "migrations": []}
+        _, new_events = self._build_trace(source)
+
+        old_exec = _executable_lines(self.events)
+        new_exec = _executable_lines(new_events)
+        old_texts = self.source.splitlines()
+        new_texts = source.splitlines()
+
+        migrations = []
+        for old_line in sorted(self.breakpoints):
+            entry = {
+                "oldLine": old_line,
+                "oldText": _line_text(old_texts, old_line),
+                "status": "confirm",
+                "newLine": None,
+                "candidates": [],
+            }
+            if old_line in old_exec:
+                target = _normalize(entry["oldText"])
+                matches = [
+                    ln
+                    for ln in new_exec
+                    if _normalize(_line_text(new_texts, ln)) == target
+                ]
+                entry["candidates"] = [
+                    {"line": ln, "text": _line_text(new_texts, ln)}
+                    for ln in matches
+                ]
+                if len(matches) == 1:
+                    entry["status"] = "reusable"
+                    entry["newLine"] = matches[0]
+            migrations.append(entry)
+
+        return {
+            "changed": True,
+            "source": source,
+            "newSourceHash": source_hash(source),
+            "executableLines": sorted(new_exec),
+            "migrations": migrations,
+        }
+
+    def commit_source_change(self, source: str, breakpoints: list[int]) -> dict:
+        """Atomically switch to an already validated new program.
+
+        Compilation happens before any field is touched, so even a
+        last-moment failure keeps the old session intact. On success the
+        old trace/cursor/stack are replaced together with the source and
+        the explicitly confirmed breakpoints; the new session always
+        starts before its first line, never on an old frame.
+        """
+        if source_hash(source) == self.source_hash:
+            return {"changed": False}
+        # Build the whole new trace first; this raises before mutation.
+        _, events = self._build_trace(source)
+        self.events = events
         self.source = source
         self.source_hash = source_hash(source)
         self.cursor = -1
-
-    def update_source(self, source: str) -> dict:
-        """Load a new program into this session.
-
-        Old breakpoints belong to the old line numbering and are never
-        silently carried over: they are explicitly invalidated and
-        reported back to the caller. The old execution position is
-        discarded because the old trace no longer applies.
-        """
-        if source_hash(source) == self.source_hash:
-            return {"changed": False, "invalidated_breakpoints": []}
-        invalidated = sorted(self.breakpoints)
-        self.breakpoints = set()
-        self._load_source(source)
-        return {"changed": True, "invalidated_breakpoints": invalidated}
+        self.breakpoints = {
+            ln for ln in breakpoints if isinstance(ln, int) and ln > 0
+        }
+        return {"changed": True}
 
     # ---- breakpoints ----
 

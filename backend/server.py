@@ -27,6 +27,11 @@ class SourceBody(BaseModel):
     source: str
 
 
+class SourceCommitBody(BaseModel):
+    source: str
+    breakpoints: list[int] = []
+
+
 class BreakpointsBody(BaseModel):
     lines: list[int]
 
@@ -103,17 +108,30 @@ def set_breakpoints(session_id: str, body: BreakpointsBody):
     return session.state()
 
 
-@app.put("/api/sessions/{session_id}/source")
-def update_source(session_id: str, body: SourceBody):
+@app.post("/api/sessions/{session_id}/source/preview")
+def preview_source(session_id: str, body: SourceBody):
     session = _get(session_id)
     try:
-        result = session.update_source(body.source)
+        result = session.preview_source_change(body.source)
+    except SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # A pure read of the candidate source: the persisted session is untouched.
+    state = session.state()
+    state["sourceChanged"] = result["changed"]
+    state["migration"] = result
+    return state
+
+
+@app.post("/api/sessions/{session_id}/source/commit")
+def commit_source(session_id: str, body: SourceCommitBody):
+    session = _get(session_id)
+    try:
+        result = session.commit_source_change(body.source, body.breakpoints)
     except SourceError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     store.touch(session)
     state = session.state()
     state["sourceChanged"] = result["changed"]
-    state["invalidatedBreakpoints"] = result["invalidated_breakpoints"]
     return state
 
 

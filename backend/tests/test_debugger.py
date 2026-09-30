@@ -94,20 +94,135 @@ def test_step_over_skips_call_body():
     assert locals_of(s.state())["r"] == "6"
 
 
-def test_source_change_invalidates_breakpoints_and_resets():
+def test_unparseable_edit_preserves_whole_session():
     s = DebugSession(LOOP)
     s.set_breakpoints([4, 5])
     s.continue_()
     assert s.state()["status"] == "paused"
-    result = s.update_source("print(1)\nprint(2)\n")
-    assert result["changed"] is True
-    assert result["invalidated_breakpoints"] == [4, 5]
+    paused_line = s.state()["line"]
+    paused_locals = locals_of(s.state())
+    paused_stack_len = len(s.state()["stack"])
+    paused_cursor = s.cursor
+
+    # Repeated invalid submissions must never touch the live session.
+    for bad in ("let = \n", "while \n", "fun ("):
+        with pytest.raises(SourceError):
+            s.preview_source_change(bad)
+        with pytest.raises(SourceError):
+            s.commit_source_change(bad, [])
+        kept = s.state()
+        assert kept["source"] == LOOP
+        assert kept["breakpoints"] == [4, 5]
+        assert kept["line"] == paused_line
+        assert len(kept["stack"]) == paused_stack_len
+        assert locals_of(kept) == paused_locals
+        assert s.cursor == paused_cursor
+
+
+def test_recursive_pause_edit_keeps_old_frames_until_commit():
+    s = DebugSession(RECURSIVE)
+    s.set_breakpoints([2])
+    s.continue_()
+    s.continue_()
+    assert len(s.state()["stack"]) == 3
+    top_n = locals_of(s.state())["n"]
+
+    new_source = RECURSIVE.replace("n * 10", "n * 20")
+    preview = s.preview_source_change(new_source)
+    assert preview["changed"] is True
+    # Preview never mutates: old recursive frames and current line remain.
+    assert len(s.state()["stack"]) == 3
+    assert locals_of(s.state())["n"] == top_n
+    assert s.state()["breakpoints"] == [2]
+
+
+def test_preview_marks_reusable_and_confirm_breakpoints():
+    s = DebugSession(LOOP)
+    s.set_breakpoints([3, 4])
+    # Line 3 (while header) is unique and shifts by one -> reusable.
+    # Line 4's statement text also exists at new line 5, and a second
+    # identical statement is inserted -> ambiguous -> needs confirm.
+    edited = (
+        "let i = 0\n"
+        "let total = 0\n"
+        "let note = 1\n"
+        "while i < 5\n"
+        "    total = total + i\n"
+        "    total = total + i\n"
+        "    i = i + 1\n"
+        "print(total)\n"
+    )
+    preview = s.preview_source_change(edited)
+    by_old = {m["oldLine"]: m for m in preview["migrations"]}
+    assert by_old[3]["status"] == "reusable"
+    assert by_old[3]["newLine"] == 4
+    assert by_old[4]["status"] == "confirm"
+    assert by_old[4]["newLine"] is None
+    assert {c["line"] for c in by_old[4]["candidates"]} == {5, 6}
+    assert preview["executableLines"]
+
+
+def test_cancel_switch_returns_to_original_session():
+    s = DebugSession(LOOP)
+    s.set_breakpoints([4])
+    s.continue_()
+    before = s.state()
+    s.preview_source_change("print(1)\n")
+    # "Cancel" = simply don't commit; session state is byte-for-byte usable.
+    s.continue_()
+    after = s.state()
+    assert after["line"] == 4
+    assert locals_of(after)["i"] == "1"
+    assert after["breakpoints"] == before["breakpoints"]
+
+
+def test_commit_resets_trace_with_confirmed_breakpoints():
+    s = DebugSession(LOOP)
+    s.set_breakpoints([4])
+    s.continue_()
+    assert s.state()["status"] == "paused"
+
+    new_source = "print(1)\nprint(2)\n"
+    s.commit_source_change(new_source, [])
     state = s.state()
+    assert state["source"] == new_source
+    assert state["line"] is None
+    assert state["stack"] == []
     assert state["breakpoints"] == []
-    assert state["line"] is None  # old pause position discarded
-    # Same source again is a no-op.
-    result = s.update_source("print(1)\nprint(2)\n")
-    assert result["changed"] == False
+    assert state["status"] == "paused"
+    # The new trace is live and never carries old frames.
+    s.continue_()
+    assert s.state()["status"] == "finished"
+    assert s.state()["output"] == "1\n2\n"
+
+
+def test_switch_after_save_and_reopen(tmp_path):
+    store = SessionStore(directory=tmp_path)
+    s = store.create(RECURSIVE)
+    s.set_breakpoints([2])
+    s.continue_()
+    s.continue_()
+    store.touch(s)
+    old_line = s.state()["line"]
+    assert len(s.state()["stack"]) == 3
+
+    reopened = SessionStore(directory=tmp_path).get(s.id)
+    assert reopened.state()["line"] == old_line
+    new_source = RECURSIVE.replace("fact", "fct")
+    preview = reopened.preview_source_change(new_source)
+    assert preview["changed"] is True
+    migrated = [m["newLine"] for m in preview["migrations"] if m["status"] == "reusable"]
+    reopened.commit_source_change(new_source, migrated)
+    store.touch(reopened)
+    state = reopened.state()
+    assert state["line"] is None
+    assert state["stack"] == []
+    # The newly reopened record belongs entirely to the new program.
+    again = SessionStore(directory=tmp_path).get(s.id)
+    assert again.state()["source"] == new_source
+    assert again.state()["stack"] == []
+    again.continue_()
+    assert again.state()["line"] == 2
 
 
 def test_save_and_reopen_restores_pause(tmp_path):

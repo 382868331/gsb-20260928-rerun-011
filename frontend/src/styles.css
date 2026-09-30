@@ -28,6 +28,17 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 .banner.notice { background: #1e3a4a; color: #7fd4ff; }
 .banner.error { background: #4a1e1e; color: #ff8a8a; }
+.banner.migration { background: #2a2e1f; color: #e8e2b0; text-align: left; }
+.migration-title { font-weight: 600; margin-bottom: 6px; }
+.migration-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; font-size: 13px; flex-wrap: wrap; }
+.migration-row label { display: flex; align-items: center; gap: 6px; }
+.migration-row code { color: #c9c9c9; font-family: ui-monospace, monospace; }
+.tag-ok { color: #8ee08e; font-size: 12px; }
+.tag-warn { color: #ffd479; font-size: 12px; }
+.migration-target { color: #8ee08e; font-size: 12px; }
+.migration-actions { display: flex; gap: 10px; margin-top: 8px; }
+.migration-actions .primary { font-weight: 600; }
+.migration-hint { color: #b0aa80; font-size: 12px; margin-top: 6px; }
 main { flex: 1; display: flex; min-height: 0; }
 .editor { flex: 1; padding: 12px; overflow: auto; }
 .editor-inner {

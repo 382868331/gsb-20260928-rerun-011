@@ -27,7 +27,28 @@ export interface SessionState {
   sourceHash: string;
   error: { line: number; message: string; stack: FrameSnapshot[] } | null;
   sourceChanged?: boolean;
-  invalidatedBreakpoints?: number[];
+  migration?: MigrationPreview | null;
+}
+
+export interface MigrationCandidate {
+  line: number;
+  text: string;
+}
+
+export interface MigrationItem {
+  oldLine: number;
+  oldText: string;
+  status: "reusable" | "confirm";
+  newLine: number | null;
+  candidates: MigrationCandidate[];
+}
+
+export interface MigrationPreview {
+  changed: boolean;
+  source?: string;
+  newSourceHash?: string;
+  executableLines?: number[];
+  migrations: MigrationItem[];
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -63,9 +84,14 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ lines }),
     }),
-  updateSource: (id: string, source: string) =>
-    request<SessionState>(`/api/sessions/${id}/source`, {
-      method: "PUT",
+  previewSource: (id: string, source: string) =>
+    request<SessionState>(`/api/sessions/${id}/source/preview`, {
+      method: "POST",
       body: JSON.stringify({ source }),
+    }),
+  commitSource: (id: string, source: string, breakpoints: number[]) =>
+    request<SessionState>(`/api/sessions/${id}/source/commit`, {
+      method: "POST",
+      body: JSON.stringify({ source, breakpoints }),
     }),
 };

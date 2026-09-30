@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, SessionState } from "./api";
+import {
+  api,
+  MigrationPreview,
+  SessionState,
+} from "./api";
 
 const SAMPLE = `fun fact(n)
     let local = n * 10
@@ -22,6 +26,12 @@ export default function App() {
   const [selectedFrame, setSelectedFrame] = useState<number>(-1);
   const [notice, setNotice] = useState<string>("");
   const [error, setError] = useState<string>("");
+  // Pending source switch: the candidate text plus per-breakpoint choices.
+  // While this is set the live session still belongs to the old program.
+  const [preview, setPreview] = useState<MigrationPreview | null>(null);
+  const [pendingSource, setPendingSource] = useState<string>("");
+  // Map of old breakpoint line -> chosen new line (or null to drop it).
+  const [bpChoices, setBpChoices] = useState<Record<number, number | null>>({});
 
   const dirty = useMemo(
     () => session !== null && source !== session.source,
@@ -39,22 +49,12 @@ export default function App() {
     try {
       const state = await action();
       setSession(state);
-      if (state.invalidatedBreakpoints && state.invalidatedBreakpoints.length > 0) {
-        setNotice(
-          `源程序已变化，旧断点（第 ${state.invalidatedBreakpoints.join(
-            "、"
-          )} 行）已失效并清除，请重新设置。`
-        );
-      } else if (state.sourceChanged) {
-        setNotice("源程序已变化，旧会话位置已重置。");
-      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }
 
   const start = () => run(() => api.create(source));
-  const applySource = () => session && run(() => api.updateSource(session.id, source));
   const stepInto = () => session && run(() => api.step(session.id, "into"));
   const stepOver = () => session && run(() => api.step(session.id, "over"));
   const cont = () => session && run(() => api.continue(session.id));
@@ -69,6 +69,62 @@ export default function App() {
     run(() => api.setBreakpoints(session.id, lines));
   }
 
+  async function applySource() {
+    if (!session) return;
+    setError("");
+    setNotice("");
+    try {
+      const state = await api.previewSource(session.id, source);
+      const migration = state.migration ?? null;
+      if (!migration || !migration.changed) {
+        setPreview(null);
+        setNotice("新程序与当前会话一致，无需切换。");
+        return;
+      }
+      setPendingSource(source);
+      setPreview(migration);
+      const choices: Record<number, number | null> = {};
+      for (const item of migration.migrations) {
+        choices[item.oldLine] = item.newLine;
+      }
+      setBpChoices(choices);
+    } catch (e) {
+      // Parse failure: leave editor text and the whole old session intact.
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function cancelSwitch() {
+    setPreview(null);
+    setPendingSource("");
+    setBpChoices({});
+    if (session) {
+      // Restore the editor to the program the live session actually runs.
+      setSource(session.source);
+    }
+    setNotice("已取消切换，继续使用原调试会话。");
+    setError("");
+  }
+
+  async function confirmSwitch() {
+    if (!session || !preview) return;
+    const lines = Object.values(bpChoices).filter(
+      (ln): ln is number => ln !== null && ln !== undefined
+    );
+    try {
+      const state = await api.commitSource(session.id, pendingSource, lines);
+      setSession(state);
+      setSource(state.source);
+      setPreview(null);
+      setPendingSource("");
+      setBpChoices({});
+      setNotice("已切换到新程序，断点迁移已应用，会话从头开始。");
+      setError("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   const lines = source.split("\n");
   const stack = session?.stack ?? [];
   const frameIndex =
@@ -77,6 +133,13 @@ export default function App() {
       : stack.length - 1;
   const frame = frameIndex >= 0 ? stack[frameIndex] : null;
   const paused = session?.status === "paused";
+  const pendingLines = preview
+    ? new Set(
+        Object.values(bpChoices).filter(
+          (ln): ln is number => ln !== null
+        )
+      )
+    : null;
 
   return (
     <div className="app">
@@ -100,7 +163,77 @@ export default function App() {
       {dirty && (
         <div className="banner">
           源程序已修改，尚未应用到调试会话。
-          <button onClick={applySource}>应用新程序（旧断点将失效）</button>
+          <button onClick={applySource} disabled={preview !== null}>
+            应用新程序（先预览断点迁移）
+          </button>
+        </div>
+      )}
+      {preview && (
+        <div className="banner migration">
+          <div className="migration-title">断点迁移预览</div>
+          {preview.migrations.length === 0 && (
+            <div className="migration-row">当前会话没有断点，切换后将从头开始。</div>
+          )}
+          {preview.migrations.map((item) => {
+            const chosen = bpChoices[item.oldLine] ?? null;
+            const reusable = item.status === "reusable";
+            return (
+              <div key={item.oldLine} className="migration-row">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={chosen !== null}
+                    onChange={(e) =>
+                      setBpChoices((prev) => ({
+                        ...prev,
+                        [item.oldLine]: e.target.checked
+                          ? item.newLine ??
+                              (item.candidates[0]?.line ?? null)
+                          : null,
+                      }))
+                    }
+                  />
+                  <span className={reusable ? "tag-ok" : "tag-warn"}>
+                    {reusable ? "可继续使用" : "需重新确认"}
+                  </span>
+                  第 {item.oldLine} 行
+                  <code>{item.oldText || "（空行）"}</code>
+                </label>
+                {chosen !== null && item.candidates.length > 0 ? (
+                  <select
+                    value={chosen}
+                    onChange={(e) =>
+                      setBpChoices((prev) => ({
+                        ...prev,
+                        [item.oldLine]: Number(e.target.value),
+                      }))
+                    }
+                  >
+                    {item.candidates.map((c) => (
+                      <option key={c.line} value={c.line}>
+                        → 第 {c.line} 行：{c.text || "（空行）"}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  chosen !== null && (
+                    <span className="migration-target">
+                      → 第 {chosen} 行
+                    </span>
+                  )
+                )}
+              </div>
+            );
+          })}
+          <div className="migration-actions">
+            <button className="primary" onClick={confirmSwitch}>
+              确认切换
+            </button>
+            <button onClick={cancelSwitch}>取消，回到原会话</button>
+          </div>
+          <div className="migration-hint">
+            确认前原程序的断点、调用栈与暂停位置保持不变；取消则完全回到原会话。
+          </div>
         </div>
       )}
       {notice && <div className="banner notice">{notice}</div>}
@@ -112,14 +245,16 @@ export default function App() {
             <div className="gutter">
               {lines.map((_, i) => {
                 const ln = i + 1;
-                const isBp = session?.breakpoints.includes(ln);
+                const isBp = pendingLines
+                  ? pendingLines.has(ln)
+                  : session?.breakpoints.includes(ln);
                 const isCurrent = session?.line === ln;
                 return (
                   <div
                     key={ln}
                     className={`gutter-line ${isCurrent ? "current" : ""}`}
-                    onClick={() => toggleBreakpoint(ln)}
-                    title="点击切换断点"
+                    onClick={() => !preview && toggleBreakpoint(ln)}
+                    title={preview ? "断点迁移预览中" : "点击切换断点"}
                   >
                     <span className={`bp ${isBp ? "on" : ""}`} />
                     {ln}
