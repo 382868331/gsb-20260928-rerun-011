@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   api,
+  BranchInfo,
+  FactComparison,
   MigrationPreview,
   SessionState,
 } from "./api";
@@ -32,6 +34,10 @@ export default function App() {
   const [pendingSource, setPendingSource] = useState<string>("");
   // Map of old breakpoint line -> chosen new line (or null to drop it).
   const [bpChoices, setBpChoices] = useState<Record<number, number | null>>({});
+  const [branches, setBranches] = useState<BranchInfo[]>([]);
+  const [newBranchName, setNewBranchName] = useState("");
+  const [compareTarget, setCompareTarget] = useState<string>("");
+  const [comparison, setComparison] = useState<FactComparison | null>(null);
 
   const dirty = useMemo(
     () => session !== null && source !== session.source,
@@ -43,18 +49,47 @@ export default function App() {
     setSelectedFrame(-1);
   }, [session?.line, session?.kind, session?.status]);
 
+  useEffect(() => {
+    if (!session) {
+      setBranches([]);
+      setComparison(null);
+      return;
+    }
+    api.branches(session.id).then((result) => {
+      setBranches(result.branches);
+      setCompareTarget((current) => {
+        if (current && result.branches.some((b) => b.id === current)) return current;
+        return result.branches.find((b) => b.id !== session.id)?.id ?? "";
+      });
+    }).catch(() => setBranches([]));
+  }, [
+    session?.id,
+    session?.cursor,
+    session?.sourceHash,
+    session?.breakpoints.join("-"),
+  ]);
+
   async function run(action: () => Promise<SessionState>) {
     setError("");
     setNotice("");
     try {
       const state = await action();
       setSession(state);
+      return state;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      return null;
     }
   }
 
   const start = () => run(() => api.create(source));
+  function openBranch(id: string) {
+    setPreview(null);
+    setPendingSource("");
+    setBpChoices({});
+    setComparison(null);
+    return run(() => api.get(id));
+  }
   const stepInto = () => session && run(() => api.step(session.id, "into"));
   const stepOver = () => session && run(() => api.step(session.id, "over"));
   const cont = () => session && run(() => api.continue(session.id));
@@ -111,8 +146,16 @@ export default function App() {
     const lines = Object.values(bpChoices).filter(
       (ln): ln is number => ln !== null && ln !== undefined
     );
+    const mappings = Object.entries(bpChoices)
+      .map(([oldLine, newLine]) => ({ oldLine: Number(oldLine), newLine }))
+      .filter((item): item is { oldLine: number; newLine: number } => item.newLine !== null);
     try {
-      const state = await api.commitSource(session.id, pendingSource, lines);
+      const state = await api.commitSource(
+        session.id,
+        pendingSource,
+        lines,
+        mappings
+      );
       setSession(state);
       setSource(state.source);
       setPreview(null);
@@ -120,6 +163,51 @@ export default function App() {
       setBpChoices({});
       setNotice("已切换到新程序，断点迁移已应用，会话从头开始。");
       setError("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function forkBranch() {
+    if (!session) return;
+    await run(async () => {
+      const result = await api.fork(session.id, newBranchName);
+      setNewBranchName("");
+      setBranches(result.siblings);
+      setComparison(null);
+      setPreview(null);
+      setPendingSource("");
+      setBpChoices({});
+      setSource(result.branch.source);
+      return result.branch;
+    });
+  }
+
+  async function abandonBranch(branch: BranchInfo) {
+    if (!session) return;
+    const remaining = branches.filter((b) => b.id !== branch.id);
+    const anchor = remaining.find((b) => b.id === branch.parentId) ?? remaining[0];
+    setError("");
+    try {
+      if (anchor && branch.id === session.id) {
+        const state = await api.get(anchor.id);
+        setSession(state);
+        setSource(state.source);
+      }
+      const result = await api.abandon(session.id, branch.id);
+      setBranches(result.branches);
+      setComparison(null);
+      setNotice(branch.id === session.id ? "已放弃失败实验，回到原暂停现场。" : "分支已放弃，其他分支未受影响。");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function compareWithTarget() {
+    if (!session || !compareTarget) return;
+    setError("");
+    try {
+      setComparison(await api.compare(session.id, compareTarget));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -238,6 +326,93 @@ export default function App() {
       )}
       {notice && <div className="banner notice">{notice}</div>}
       {error && <div className="banner error">{error}</div>}
+
+      {session && (
+        <section className="panel branch-panel">
+          <h2>实验分支（工作区 {session.workspaceId.slice(0, 6)}）</h2>
+          <div className="branch-list">
+            {branches.map((branch) => (
+              <div
+                key={branch.id}
+                className={`branch ${branch.id === session.id ? "active" : ""}`}
+              >
+                <button
+                  className="branch-select"
+                  onClick={() => {
+                    void openBranch(branch.id).then((state) => {
+                      if (state) setSource(state.source);
+                    });
+                  }}
+                >
+                  <strong>{branch.name}</strong>
+                  <span>{branch.id.slice(0, 6)} · 暂停事件 {branch.cursor}</span>
+                  <span title={branch.sourceHash}>修订 {branch.sourceHash.slice(0, 6)} · 断点 {branch.breakpoints.join(",") || "无"}</span>
+                </button>
+                <button onClick={() => abandonBranch(branch)}>放弃</button>
+              </div>
+            ))}
+          </div>
+          <div className="branch-actions">
+            <input
+              value={newBranchName}
+              onChange={(e) => setNewBranchName(e.target.value)}
+              placeholder="新实验名称，如：修复边界"
+            />
+            <button onClick={forkBranch}>从当前暂停现场派生分支</button>
+            <select value={compareTarget} onChange={(e) => setCompareTarget(e.target.value)}>
+              <option value="">选择对比分支</option>
+              {branches.filter((b) => b.id !== session.id).map((b) => (
+                <option key={b.id} value={b.id}>{b.name}</option>
+              ))}
+            </select>
+            <button onClick={compareWithTarget} disabled={!compareTarget}>按执行事实对比</button>
+          </div>
+          {session.confirmedMigrations && session.confirmedMigrations.length > 0 && (
+            <div className="migration-hint">
+              已保存 {session.confirmedMigrations.length} 组人工确认的断点迁移关系，重开后仍生效。
+            </div>
+          )}
+          {comparison && (
+            <div className="comparison">
+              <h3>
+                {comparison.branches.a.name} ↔ {comparison.branches.b.name}
+              </h3>
+              <div>
+                已执行事实：{comparison.executedCounts.a} / {comparison.executedCounts.b}
+                {comparison.firstDifference ? (
+                  <div className="diff-first">
+                    第一次不同：第 {comparison.firstDifference.seq + 1} 个执行事实 — {comparison.firstDifference.difference.message}
+                  </div>
+                ) : (
+                  <div className="diff-first ok">已比较的变量值与输出完全相同。</div>
+                )}
+              </div>
+              {comparison.firstDifference && (
+                <div className="diff-grid">
+                  {(["a", "b"] as const).map((side) => {
+                    const fact = comparison.firstDifference?.[side];
+                    const info = comparison.branches[side];
+                    return (
+                      <div key={side}>
+                        <strong>{info.name}</strong>
+                        {fact ? (
+                          <>
+                            <div>修订 {fact.sourceHash.slice(0, 6)} · 第 {fact.line} 行：{fact.lineText}</div>
+                            <div>新增输出：{fact.postOutputDelta || "（无）"}</div>
+                            <div>{fact.postFrames.map((f) => `${f.name}: ${Object.entries(f.locals).map(([k, v]) => `${k}=${v}`).join(", ") || "无变量"}`).join(" ｜ ")}</div>
+                          </>
+                        ) : (
+                          <div>该分支没有更多执行记录</div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
 
       <main>
         <section className="editor">

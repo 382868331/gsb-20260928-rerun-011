@@ -273,3 +273,141 @@ def test_loop_runs_to_clean_finish():
 def test_bad_source_rejected():
     with pytest.raises(SourceError):
         DebugSession("let = \n")
+
+
+def test_forked_branches_keep_independent_pause_sites():
+    base = DebugSession(RECURSIVE)
+    base.set_breakpoints([2])
+    base.continue_()  # fact(3), then fork before continuing into fact(2)
+    assert locals_of(base.state())["n"] == "3"
+
+    alpha = base.fork_branch("实验A")
+    beta = base.fork_branch("实验B")
+    assert alpha.workspace_id == beta.workspace_id == base.workspace_id
+    assert alpha.forked_from == beta.forked_from == base.cursor
+
+    alpha.set_breakpoints([2, 3])  # independent breakpoint set
+    alpha.step_into()  # line 3: if n <= 1 in the same fact(3) frame
+    assert alpha.state()["line"] == 3
+    alpha.continue_()  # next reached breakpoint is line 2 inside fact(2)
+    # Sibling's breakpoint set and pause position are untouched.
+    assert beta.breakpoints == {2}
+    assert beta.cursor == base.cursor
+    assert locals_of(beta.state())["n"] == "3"
+
+    beta.continue_()
+    assert locals_of(beta.state())["n"] == "2"
+    beta.continue_()
+    assert locals_of(beta.state())["n"] == "1"
+    # Switching back to alpha must not carry beta's deeper pause.
+    assert locals_of(alpha.state())["n"] == "2"
+    assert len(alpha.state()["stack"]) != len(beta.state()["stack"])
+
+
+def test_failed_edit_and_abandon_do_not_hurt_parent_or_sibling(tmp_path):
+    store = SessionStore(directory=tmp_path)
+    base = store.create(LOOP)
+    base.set_breakpoints([4])
+    base.continue_()
+    bad_branch = store.fork(base, "失败实验")
+    good_branch = store.fork(base, "继续实验")
+
+    with pytest.raises(SourceError):
+        bad_branch.preview_source_change("let = \n")
+    with pytest.raises(SourceError):
+        bad_branch.commit_source_change("let = \n", [])
+    store.abandon(bad_branch.id)
+
+    assert store.get(base.id).cursor == base.cursor
+    reopened_good = store.get(good_branch.id)
+    assert reopened_good.state()["line"] == 4
+    assert locals_of(reopened_good.state())["i"] == "0"
+    reopened_good.continue_()
+    assert locals_of(reopened_good.state())["i"] == "1"
+    assert {b["id"] for b in store.workspace_branches(base.workspace_id)} == {
+        base.id,
+        good_branch.id,
+    }
+
+
+def test_all_unfinished_branches_restore_with_confirmed_migrations(tmp_path):
+    store = SessionStore(directory=tmp_path)
+    base = store.create(LOOP)
+    base.set_breakpoints([3])
+    base.continue_()
+    edited = (
+        "let i = 0\n"
+        "let total = 0\n"
+        "let note = 1\n"
+        "while i < 5\n"
+        "    total = total + i\n"
+        "    i = i + 1\n"
+        "print(total)\n"
+    )
+    preview = base.preview_source_change(edited)
+    mappings = [
+        {"oldLine": m["oldLine"], "newLine": m["newLine"]}
+        for m in preview["migrations"]
+        if m["status"] == "reusable"
+    ]
+    base.commit_source_change(edited, [m["newLine"] for m in mappings], mappings)
+    store.touch(base)
+    child = store.fork(base, "迁移检查")
+    child.continue_()
+    paused_line = child.state()["line"]
+    store.touch(child)
+
+    reopened_store = SessionStore(directory=tmp_path)
+    root = reopened_store.get(base.id)
+    branch = reopened_store.get(child.id)
+    assert root.source == edited
+    assert root.confirmed_migrations[0]["mappings"] == [{"oldLine": 3, "newLine": 4}]
+    assert branch.confirmed_migrations == root.confirmed_migrations
+    assert branch.state()["line"] == paused_line
+    assert locals_of(branch.state())["i"] == "0"
+
+
+def test_compare_identifies_first_variable_and_revision_difference():
+    source_a = "let x = 1\nprint(x)\n"
+    source_b = "let x = 2\nprint(x)\n"
+    a = DebugSession(source_a)
+    b = DebugSession(source_b)
+    a.step_into()
+    b.step_into()
+    comparison = DebugSession.compare_facts(a, b)
+    first = comparison["firstDifference"]
+    assert first["difference"]["kind"] == "variable"
+    assert first["difference"]["revisionChanged"] is True
+    var_diff = first["difference"]["variables"][0]
+    assert (var_diff["name"], var_diff["a"], var_diff["b"]) == ("x", "1", "2")
+
+    a.step_into()
+    b.step_into()
+    comparison = DebugSession.compare_facts(a, b)
+    # After the variable diverges, the subsequent print output differs too;
+    # the report stops at the earliest variable difference.
+    assert comparison["firstDifference"]["difference"]["kind"] == "variable"
+
+
+def test_compare_output_difference_and_revision_line_warning():
+    a = DebugSession("print(1)\n")
+    b = DebugSession("print(2)\n")
+    a.step_into()
+    b.step_into()
+    comparison = DebugSession.compare_facts(a, b)
+    first = comparison["firstDifference"]
+    assert first["difference"]["kind"] == "output"
+    assert first["difference"]["lineNumberSame"] is True
+    assert first["difference"]["revisionChanged"] is True
+    assert "行号相同不代表同一步" in first["difference"]["message"]
+
+
+def test_compare_same_revision_with_different_branch_length():
+    a = DebugSession(LOOP)
+    b = DebugSession(LOOP)
+    a.step_into()
+    a.step_into()
+    b.step_into()
+    comparison = DebugSession.compare_facts(a, b)
+    assert comparison["firstDifference"]["difference"]["kind"] == "length"
+    assert comparison["executedCounts"] == {"a": 2, "b": 1}

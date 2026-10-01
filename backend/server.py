@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .debugger import SessionStore, SourceError
+from .debugger import DebugSession, SessionStore, SourceError
 
 app = FastAPI(title="MiniLang 可视化调试器")
 app.add_middleware(
@@ -30,6 +30,15 @@ class SourceBody(BaseModel):
 class SourceCommitBody(BaseModel):
     source: str
     breakpoints: list[int] = []
+    migrations: list[dict] | None = None
+
+
+class ForkBody(BaseModel):
+    name: str = ""
+
+
+class CompareBody(BaseModel):
+    otherId: str
 
 
 class BreakpointsBody(BaseModel):
@@ -84,6 +93,46 @@ def step(session_id: str, body: StepBody):
     return session.state()
 
 
+@app.post("/api/sessions/{session_id}/branches")
+def fork_branch(session_id: str, body: ForkBody):
+    session = _get(session_id)
+    child = store.fork(session, body.name)
+    return {"branch": child.state(), "siblings": store.workspace_branches(child.workspace_id)}
+
+
+@app.get("/api/sessions/{session_id}/branches")
+def list_branches(session_id: str):
+    session = _get(session_id)
+    return {
+        "workspaceId": session.workspace_id,
+        "branches": store.workspace_branches(session.workspace_id),
+    }
+
+
+@app.delete("/api/sessions/{session_id}/branches/{branch_id}")
+def abandon_branch(session_id: str, branch_id: str):
+    parent = _get(session_id)
+    if not (store.directory / f"{branch_id}.json").exists():
+        raise HTTPException(status_code=404, detail="分支不存在")
+    store.abandon(branch_id)
+    return {
+        "workspaceId": parent.workspace_id,
+        "branches": store.workspace_branches(parent.workspace_id),
+    }
+
+
+@app.post("/api/sessions/{session_id}/compare")
+def compare_branches(session_id: str, body: CompareBody):
+    session = _get(session_id)
+    try:
+        other = store.get(body.otherId)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="对比分支不存在")
+    if other.workspace_id != session.workspace_id:
+        raise HTTPException(status_code=400, detail="只能比较同一暂停现场派生的分支")
+    return DebugSession.compare_facts(session, other)
+
+
 @app.post("/api/sessions/{session_id}/continue")
 def continue_(session_id: str):
     session = _get(session_id)
@@ -126,7 +175,9 @@ def preview_source(session_id: str, body: SourceBody):
 def commit_source(session_id: str, body: SourceCommitBody):
     session = _get(session_id)
     try:
-        result = session.commit_source_change(body.source, body.breakpoints)
+        result = session.commit_source_change(
+            body.source, body.breakpoints, body.migrations
+        )
     except SourceError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     store.touch(session)
