@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   api,
+  BranchInfo,
+  BpMigration,
+  CompareResult,
   MigrationPreview,
   SessionState,
 } from "./api";
@@ -20,6 +23,13 @@ const STATUS_LABEL: Record<string, string> = {
   error: "运行错误",
 };
 
+const REASON_LABEL: Record<string, string> = {
+  variables: "变量值不同",
+  output: "输出不同",
+  kind: "事件类型不同",
+  length: "一侧执行已结束",
+};
+
 export default function App() {
   const [source, setSource] = useState(SAMPLE);
   const [session, setSession] = useState<SessionState | null>(null);
@@ -32,6 +42,12 @@ export default function App() {
   const [pendingSource, setPendingSource] = useState<string>("");
   // Map of old breakpoint line -> chosen new line (or null to drop it).
   const [bpChoices, setBpChoices] = useState<Record<number, number | null>>({});
+  // When true, confirming the migration banner forks a new branch
+  // instead of replacing the current session.
+  const [forkMode, setForkMode] = useState(false);
+  const [branches, setBranches] = useState<BranchInfo[]>([]);
+  const [compareTarget, setCompareTarget] = useState<string>("");
+  const [compareResult, setCompareResult] = useState<CompareResult | null>(null);
 
   const dirty = useMemo(
     () => session !== null && source !== session.source,
@@ -43,12 +59,27 @@ export default function App() {
     setSelectedFrame(-1);
   }, [session?.line, session?.kind, session?.status]);
 
+  async function refreshBranches() {
+    try {
+      const res = await api.list();
+      setBranches(res.sessions);
+    } catch {
+      // 列表刷新失败不影响调试主流程。
+    }
+  }
+
+  useEffect(() => {
+    refreshBranches();
+  }, []);
+
   async function run(action: () => Promise<SessionState>) {
     setError("");
     setNotice("");
     try {
       const state = await action();
       setSession(state);
+      setCompareResult(null);
+      refreshBranches();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -69,7 +100,7 @@ export default function App() {
     run(() => api.setBreakpoints(session.id, lines));
   }
 
-  async function applySource() {
+  async function applySource(asBranch = false) {
     if (!session) return;
     setError("");
     setNotice("");
@@ -83,6 +114,7 @@ export default function App() {
       }
       setPendingSource(source);
       setPreview(migration);
+      setForkMode(asBranch);
       const choices: Record<number, number | null> = {};
       for (const item of migration.migrations) {
         choices[item.oldLine] = item.newLine;
@@ -98,6 +130,7 @@ export default function App() {
     setPreview(null);
     setPendingSource("");
     setBpChoices({});
+    setForkMode(false);
     if (session) {
       // Restore the editor to the program the live session actually runs.
       setSource(session.source);
@@ -111,15 +144,88 @@ export default function App() {
     const lines = Object.values(bpChoices).filter(
       (ln): ln is number => ln !== null && ln !== undefined
     );
+    const migrations: BpMigration[] = preview.migrations
+      .filter((item) => (bpChoices[item.oldLine] ?? null) !== null)
+      .map((item) => ({
+        oldLine: item.oldLine,
+        newLine: bpChoices[item.oldLine] as number,
+        fromHash: session.sourceHash,
+        toHash: preview.newSourceHash,
+      }));
     try {
-      const state = await api.commitSource(session.id, pendingSource, lines);
+      const state = forkMode
+        ? await api.fork(session.id, {
+            source: pendingSource,
+            breakpoints: lines,
+            bpMigrations: migrations,
+          })
+        : await api.commitSource(session.id, pendingSource, lines);
       setSession(state);
       setSource(state.source);
       setPreview(null);
       setPendingSource("");
       setBpChoices({});
-      setNotice("已切换到新程序，断点迁移已应用，会话从头开始。");
+      setForkMode(false);
+      setNotice(
+        forkMode
+          ? "已创建实验分支，断点迁移已应用；原暂停现场保持不变。"
+          : "已切换到新程序，断点迁移已应用，会话从头开始。"
+      );
       setError("");
+      refreshBranches();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function forkBranch() {
+    if (!session) return;
+    if (dirty) {
+      // 编辑器里有未应用的修改：走断点迁移预览，确认后成为新分支。
+      await applySource(true);
+      return;
+    }
+    await run(() => api.fork(session.id, {}));
+    setNotice("已从当前暂停现场派生分支，双方互不影响。");
+  }
+
+  async function abandonBranch() {
+    if (!session || !session.parentId) return;
+    const parentId = session.parentId;
+    setError("");
+    setNotice("");
+    try {
+      await api.remove(session.id);
+      const parent = await api.get(parentId);
+      setSession(parent);
+      setSource(parent.source);
+      setCompareResult(null);
+      setNotice("已放弃实验分支，回到原暂停现场。");
+      refreshBranches();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function switchBranch(id: string) {
+    if (id === session?.id) return;
+    setPreview(null);
+    setPendingSource("");
+    setBpChoices({});
+    setForkMode(false);
+    await run(() =>
+      api.get(id).then((state) => {
+        setSource(state.source);
+        return state;
+      })
+    );
+  }
+
+  async function runCompare() {
+    if (!session || !compareTarget) return;
+    setError("");
+    try {
+      setCompareResult(await api.compare(session.id, compareTarget));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -151,10 +257,17 @@ export default function App() {
           <button onClick={stepOver} disabled={!paused}>跨过</button>
           <button onClick={cont} disabled={!paused}>继续</button>
           <button onClick={restart} disabled={!session}>重启</button>
+          <button onClick={forkBranch} disabled={!session || preview !== null}>
+            ⑂ 派生分支
+          </button>
+          {session?.parentId && (
+            <button onClick={abandonBranch}>放弃分支</button>
+          )}
           {session && (
             <span className={`status status-${session.status}`}>
               {STATUS_LABEL[session.status]}
               {session.line != null && ` · 第 ${session.line} 行`}
+              {session.parentId && ` · ${session.name}`}
             </span>
           )}
         </div>
@@ -163,14 +276,19 @@ export default function App() {
       {dirty && (
         <div className="banner">
           源程序已修改，尚未应用到调试会话。
-          <button onClick={applySource} disabled={preview !== null}>
+          <button onClick={() => applySource(false)} disabled={preview !== null}>
             应用新程序（先预览断点迁移）
+          </button>
+          <button onClick={() => applySource(true)} disabled={preview !== null}>
+            作为新分支试验
           </button>
         </div>
       )}
       {preview && (
         <div className="banner migration">
-          <div className="migration-title">断点迁移预览</div>
+          <div className="migration-title">
+            断点迁移预览{forkMode ? "（确认后创建实验分支，原现场保留）" : ""}
+          </div>
           {preview.migrations.length === 0 && (
             <div className="migration-row">当前会话没有断点，切换后将从头开始。</div>
           )}
@@ -227,9 +345,11 @@ export default function App() {
           })}
           <div className="migration-actions">
             <button className="primary" onClick={confirmSwitch}>
-              确认切换
+              {forkMode ? "确认为新分支" : "确认切换"}
             </button>
-            <button onClick={cancelSwitch}>取消，回到原会话</button>
+            <button onClick={cancelSwitch}>
+              {forkMode ? "取消，不创建分支" : "取消，回到原会话"}
+            </button>
           </div>
           <div className="migration-hint">
             确认前原程序的断点、调用栈与暂停位置保持不变；取消则完全回到原会话。
@@ -272,6 +392,126 @@ export default function App() {
         </section>
 
         <aside>
+          <section className="panel">
+            <h2>分支</h2>
+            {branches.length === 0 && <div className="empty">（无）</div>}
+            {branches.map((b) => (
+              <div
+                key={b.id}
+                className={`branch ${b.id === session?.id ? "selected" : ""}`}
+                onClick={() => switchBranch(b.id)}
+              >
+                <span className="fname">
+                  {b.name || "未命名"}
+                  {b.id === session?.id ? "（当前）" : ""}
+                </span>
+                <span className="fline">
+                  修订 {b.sourceHash.slice(0, 6)}
+                  {b.parentId ? " · 实验分支" : " · 主分支"}
+                </span>
+              </div>
+            ))}
+            {session && session.bpMigrations.length > 0 && (
+              <div className="migrations">
+                <h3>已确认的断点迁移</h3>
+                {session.bpMigrations.map((m, i) => (
+                  <div key={i} className="migration-row">
+                    第 {m.oldLine} 行 → 第 {m.newLine} 行
+                    {m.fromHash && m.toHash && (
+                      <span className="fline">
+                        （{m.fromHash.slice(0, 6)} → {m.toHash.slice(0, 6)}）
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section className="panel">
+            <h2>分支比较</h2>
+            <div className="compare-controls">
+              <select
+                value={compareTarget}
+                onChange={(e) => setCompareTarget(e.target.value)}
+              >
+                <option value="">选择对比分支…</option>
+                {branches
+                  .filter((b) => b.id !== session?.id)
+                  .map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.name || "未命名"}（{b.sourceHash.slice(0, 6)}）
+                    </option>
+                  ))}
+              </select>
+              <button onClick={runCompare} disabled={!session || !compareTarget}>
+                比较
+              </button>
+            </div>
+            {compareResult && (
+              <div className="compare-result">
+                {!compareResult.diverged && (
+                  <div className="empty">两侧执行事实完全一致。</div>
+                )}
+                {compareResult.diverged && (
+                  <>
+                    <div>
+                      首次不同：第 {compareResult.index} 个事件（
+                      {REASON_LABEL[compareResult.reason ?? ""]}）
+                    </div>
+                    {!compareResult.sameRevision && (
+                      <div className="revision-note">
+                        两侧记录来自不同程序修订（
+                        {compareResult.left.sourceHash.slice(0, 6)} vs{" "}
+                        {compareResult.right.sourceHash.slice(0, 6)}
+                        ），相同行号不代表同一步。
+                      </div>
+                    )}
+                    {([compareResult.left, compareResult.right] as const).map(
+                      (side, i) => (
+                        <div key={i} className="compare-side">
+                          <div className="fname">
+                            {side.name} · 修订 {side.sourceHash.slice(0, 6)}
+                          </div>
+                          {side.event ? (
+                            <>
+                              <div className="fline">
+                                事件 {side.event.kind}
+                                {side.event.line != null &&
+                                  ` · 第 ${side.event.line} 行`}
+                                {side.event.message &&
+                                  ` · ${side.event.message}`}
+                              </div>
+                              {side.event.stack.length > 0 && (
+                                <div className="fline">
+                                  {side.event.stack[
+                                    side.event.stack.length - 1
+                                  ].locals
+                                    .map(
+                                      (v) =>
+                                        `${v.name}=${v.value.display}`
+                                    )
+                                    .join("，") || "（无局部变量）"}
+                                </div>
+                              )}
+                              {side.event.output && (
+                                <pre className="output">
+                                  {side.event.output}
+                                </pre>
+                              )}
+                            </>
+                          ) : (
+                            <div className="fline">（该侧已无更多事件）</div>
+                          )}
+                        </div>
+                      )
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </section>
+
           <section className="panel">
             <h2>调用栈</h2>
             {stack.length === 0 && <div className="empty">（尚未开始）</div>}

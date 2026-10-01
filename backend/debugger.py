@@ -53,9 +53,24 @@ class DebugSession:
     to their own frame and makes post-exit inspection trivial.
     """
 
-    def __init__(self, source: str, session_id: str | None = None):
+    def __init__(
+        self,
+        source: str,
+        session_id: str | None = None,
+        name: str | None = None,
+        parent_id: str | None = None,
+        fork_cursor: int | None = None,
+        bp_migrations: list[dict] | None = None,
+    ):
         self.id = session_id or uuid.uuid4().hex[:12]
         self.created_at = time.time()
+        self.name = name or ("主分支" if parent_id is None else "实验分支")
+        self.parent_id = parent_id
+        # Cursor position in the parent session this branch was forked from.
+        self.fork_cursor = fork_cursor
+        # Human-confirmed breakpoint migrations that produced this branch's
+        # breakpoints: [{"oldLine": n, "newLine": m, "fromHash": ..., "toHash": ...}].
+        self.bp_migrations: list[dict] = list(bp_migrations or [])
         self.breakpoints: set[int] = set()
         self.cursor = -1
         _, self.events = self._build_trace(source)
@@ -193,6 +208,138 @@ class DebugSession:
     def restart(self) -> None:
         self.cursor = -1
 
+    # ---- branches ----
+
+    def fork(
+        self,
+        source: str | None = None,
+        name: str | None = None,
+        breakpoints: list[int] | None = None,
+        bp_migrations: list[dict] | None = None,
+    ) -> "DebugSession":
+        """Derive an independent experiment branch from the current pause.
+
+        The parent session is never mutated. With an unchanged program the
+        branch inherits the exact pause cursor, breakpoints and trace, so
+        both sides continue from the same spot independently. With an
+        edited program the candidate is compiled first (SourceError leaves
+        every existing branch untouched) and the branch starts from the
+        top with the explicitly confirmed breakpoints; the confirmed
+        old->new line mapping is recorded so it survives save/reopen.
+        """
+        new_source = self.source if source is None else source
+        if source_hash(new_source) == self.source_hash:
+            branch = DebugSession(
+                self.source,
+                name=name,
+                parent_id=self.id,
+                fork_cursor=self.cursor,
+                bp_migrations=bp_migrations,
+            )
+            branch.breakpoints = set(self.breakpoints)
+            branch.cursor = self.cursor
+            return branch
+        # Compile fully before the branch object exists; a failed edit
+        # therefore cannot affect this session or any sibling branch.
+        DebugSession._build_trace(new_source)
+        branch = DebugSession(
+            new_source,
+            name=name,
+            parent_id=self.id,
+            fork_cursor=self.cursor,
+            bp_migrations=bp_migrations,
+        )
+        branch.breakpoints = {
+            ln for ln in (breakpoints or []) if isinstance(ln, int) and ln > 0
+        }
+        return branch
+
+    # ---- comparison ----
+
+    @staticmethod
+    def _event_fact(event: dict) -> dict:
+        """Execution facts of one event used for branch comparison.
+
+        Line numbers are deliberately excluded: across program revisions
+        the same line number is not the same step. Facts are the event
+        kind, the output produced so far, and each frame's variables.
+        """
+        return {
+            "kind": event["kind"],
+            "output": event.get("output", ""),
+            "frames": [
+                (
+                    frame["name"],
+                    tuple(
+                        (var["name"], var["value"]["display"])
+                        for var in frame["locals"]
+                    ),
+                )
+                for frame in event.get("stack", [])
+            ],
+        }
+
+    def compare(self, other: "DebugSession") -> dict:
+        """Find the first event where two branches' execution facts differ."""
+        result = {
+            "diverged": False,
+            "index": None,
+            "reason": None,
+            "sameRevision": self.source_hash == other.source_hash,
+            "left": {
+                "id": self.id,
+                "name": self.name,
+                "sourceHash": self.source_hash,
+                "event": None,
+            },
+            "right": {
+                "id": other.id,
+                "name": other.name,
+                "sourceHash": other.source_hash,
+                "event": None,
+            },
+        }
+
+        def brief(session, event):
+            if event is None:
+                return None
+            return {
+                "index": event["index"],
+                "kind": event["kind"],
+                "line": event.get("line"),
+                "sourceHash": session.source_hash,
+                "output": event.get("output", ""),
+                "stack": event.get("stack", []),
+                "message": event.get("message"),
+            }
+
+        common = min(len(self.events), len(other.events))
+        for i in range(common):
+            left_fact = self._event_fact(self.events[i])
+            right_fact = self._event_fact(other.events[i])
+            if left_fact == right_fact:
+                continue
+            if left_fact["kind"] != right_fact["kind"]:
+                reason = "kind"
+            elif left_fact["output"] != right_fact["output"]:
+                reason = "output"
+            else:
+                reason = "variables"
+            result.update({"diverged": True, "index": i, "reason": reason})
+            result["left"]["event"] = brief(self, self.events[i])
+            result["right"]["event"] = brief(other, other.events[i])
+            return result
+        if len(self.events) != len(other.events):
+            longer = self if len(self.events) > len(other.events) else other
+            result.update({"diverged": True, "index": common, "reason": "length"})
+            result["left"]["event"] = brief(
+                self, self.events[common] if longer is self else None
+            )
+            result["right"]["event"] = brief(
+                other, other.events[common] if longer is other else None
+            )
+        return result
+
     # ---- state ----
 
     def status(self) -> str:
@@ -217,6 +364,10 @@ class DebugSession:
         status = self.status()
         state = {
             "id": self.id,
+            "name": self.name,
+            "parentId": self.parent_id,
+            "forkCursor": self.fork_cursor,
+            "bpMigrations": self.bp_migrations,
             "status": status,
             "line": event.get("line"),
             "kind": event["kind"],
@@ -241,6 +392,10 @@ class DebugSession:
         return {
             "id": self.id,
             "created_at": self.created_at,
+            "name": self.name,
+            "parent_id": self.parent_id,
+            "fork_cursor": self.fork_cursor,
+            "bp_migrations": self.bp_migrations,
             "source": self.source,
             "breakpoints": sorted(self.breakpoints),
             "cursor": self.cursor,
@@ -255,7 +410,14 @@ class DebugSession:
     def load(cls, session_id: str, directory: Path = SESSIONS_DIR) -> "DebugSession":
         path = directory / f"{session_id}.json"
         record = json.loads(path.read_text())
-        session = cls(record["source"], session_id=record["id"])
+        session = cls(
+            record["source"],
+            session_id=record["id"],
+            name=record.get("name"),
+            parent_id=record.get("parent_id"),
+            fork_cursor=record.get("fork_cursor"),
+            bp_migrations=record.get("bp_migrations"),
+        )
         session.created_at = record.get("created_at", session.created_at)
         # Breakpoints are restored only because the source (and therefore
         # its line numbering) is identical to what they were set on.
@@ -277,6 +439,8 @@ class DebugSession:
             saved.append({
                 "id": record["id"],
                 "created_at": record.get("created_at"),
+                "name": record.get("name"),
+                "parentId": record.get("parent_id"),
                 "sourceHash": source_hash(record.get("source", "")),
                 "preview": record.get("source", "").strip().splitlines()[:1],
             })
@@ -292,6 +456,11 @@ class SessionStore:
 
     def create(self, source: str) -> DebugSession:
         session = DebugSession(source)
+        self.sessions[session.id] = session
+        session.save(self.directory)
+        return session
+
+    def register(self, session: DebugSession) -> DebugSession:
         self.sessions[session.id] = session
         session.save(self.directory)
         return session

@@ -17,6 +17,10 @@ export interface FrameSnapshot {
 
 export interface SessionState {
   id: string;
+  name: string;
+  parentId: string | null;
+  forkCursor: number | null;
+  bpMigrations: BpMigration[];
   status: "paused" | "finished" | "error";
   line: number | null;
   kind: string;
@@ -28,6 +32,48 @@ export interface SessionState {
   error: { line: number; message: string; stack: FrameSnapshot[] } | null;
   sourceChanged?: boolean;
   migration?: MigrationPreview | null;
+}
+
+export interface BpMigration {
+  oldLine: number;
+  newLine: number;
+  fromHash?: string;
+  toHash?: string;
+}
+
+export interface BranchInfo {
+  id: string;
+  name: string | null;
+  parentId: string | null;
+  created_at: number | null;
+  sourceHash: string;
+  preview: string[];
+}
+
+export interface CompareEvent {
+  index: number;
+  kind: string;
+  line: number | null;
+  sourceHash: string;
+  output: string;
+  stack: FrameSnapshot[];
+  message: string | null;
+}
+
+export interface CompareSide {
+  id: string;
+  name: string;
+  sourceHash: string;
+  event: CompareEvent | null;
+}
+
+export interface CompareResult {
+  diverged: boolean;
+  index: number | null;
+  reason: "variables" | "output" | "kind" | "length" | null;
+  sameRevision: boolean;
+  left: CompareSide;
+  right: CompareSide;
 }
 
 export interface MigrationCandidate {
@@ -70,6 +116,24 @@ export const api = {
       body: JSON.stringify({ source }),
     }),
   get: (id: string) => request<SessionState>(`/api/sessions/${id}`),
+  list: () => request<{ sessions: BranchInfo[] }>("/api/sessions"),
+  remove: (id: string) =>
+    request<{ ok: boolean }>(`/api/sessions/${id}`, { method: "DELETE" }),
+  fork: (
+    id: string,
+    body: {
+      source?: string;
+      name?: string;
+      breakpoints?: number[];
+      bpMigrations?: BpMigration[];
+    }
+  ) =>
+    request<SessionState>(`/api/sessions/${id}/fork`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  compare: (id: string, otherId: string) =>
+    request<CompareResult>(`/api/sessions/${id}/compare/${otherId}`),
   step: (id: string, mode: "into" | "over") =>
     request<SessionState>(`/api/sessions/${id}/step`, {
       method: "POST",

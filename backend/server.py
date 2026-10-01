@@ -40,6 +40,13 @@ class StepBody(BaseModel):
     mode: str = "into"  # "into" | "over"
 
 
+class ForkBody(BaseModel):
+    source: str | None = None
+    name: str | None = None
+    breakpoints: list[int] = []
+    bpMigrations: list[dict] = []
+
+
 def _get(session_id: str):
     try:
         return store.get(session_id)
@@ -98,6 +105,30 @@ def restart(session_id: str):
     session.restart()
     store.touch(session)
     return session.state()
+
+
+@app.post("/api/sessions/{session_id}/fork")
+def fork(session_id: str, body: ForkBody):
+    session = _get(session_id)
+    try:
+        branch = session.fork(
+            source=body.source,
+            name=body.name,
+            breakpoints=body.breakpoints,
+            bp_migrations=body.bpMigrations,
+        )
+    except SourceError as exc:
+        # A failed experiment edit never touches any existing branch.
+        raise HTTPException(status_code=400, detail=str(exc))
+    store.register(branch)
+    return branch.state()
+
+
+@app.get("/api/sessions/{session_id}/compare/{other_id}")
+def compare(session_id: str, other_id: str):
+    left = _get(session_id)
+    right = _get(other_id)
+    return left.compare(right)
 
 
 @app.put("/api/sessions/{session_id}/breakpoints")

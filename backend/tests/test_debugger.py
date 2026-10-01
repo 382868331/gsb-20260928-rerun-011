@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from backend.debugger import DebugSession, SessionStore, SourceError
+from backend.debugger import DebugSession, SessionStore, SourceError, source_hash
 
 RECURSIVE = """fun fact(n)
     let local = n * 10
@@ -273,3 +273,143 @@ def test_loop_runs_to_clean_finish():
 def test_bad_source_rejected():
     with pytest.raises(SourceError):
         DebugSession("let = \n")
+
+
+def test_fork_shares_pause_but_branches_stay_independent():
+    parent = DebugSession(RECURSIVE)
+    parent.set_breakpoints([2])
+    parent.continue_()
+    parent.continue_()
+    assert len(parent.state()["stack"]) == 3
+
+    branch_a = parent.fork(name="实验A")
+    branch_b = parent.fork(name="实验B")
+    # Both start at the exact same pause with the same breakpoints.
+    for branch in (branch_a, branch_b):
+        assert branch.state()["line"] == parent.state()["line"]
+        assert locals_of(branch.state())["n"] == "2"
+        assert branch.state()["breakpoints"] == [2]
+        assert branch.parent_id == parent.id
+
+    # Branch A moves on and changes breakpoints; B and parent stay put.
+    branch_a.set_breakpoints([4])
+    branch_a.continue_()
+    assert branch_a.state()["line"] == 4
+    assert branch_b.state()["line"] == parent.state()["line"]
+    assert branch_b.state()["breakpoints"] == [2]
+    assert parent.state()["breakpoints"] == [2]
+    # Stepping B does not move A.
+    branch_b.step_into()
+    assert branch_a.state()["line"] == 4
+
+
+def test_fork_with_edit_failure_leaves_all_branches_intact():
+    parent = DebugSession(LOOP)
+    parent.set_breakpoints([4])
+    parent.continue_()
+    sibling = parent.fork()
+    with pytest.raises(SourceError):
+        parent.fork(source="while \n")
+    # Parent and existing sibling are untouched by the failed experiment.
+    assert parent.state()["line"] == 4
+    assert parent.state()["breakpoints"] == [4]
+    assert locals_of(sibling.state()) == locals_of(parent.state())
+
+
+def test_fork_with_edit_records_confirmed_migrations():
+    parent = DebugSession(LOOP)
+    parent.set_breakpoints([4])
+    parent.continue_()
+    edited = "let note = 1\n" + LOOP
+    preview = parent.preview_source_change(edited)
+    migration = preview["migrations"][0]
+    assert migration["status"] == "reusable"
+    branch = parent.fork(
+        source=edited,
+        breakpoints=[migration["newLine"]],
+        bp_migrations=[{
+            "oldLine": migration["oldLine"],
+            "newLine": migration["newLine"],
+            "fromHash": parent.source_hash,
+            "toHash": preview["newSourceHash"],
+        }],
+    )
+    # Edited branch restarts from the top with migrated breakpoints.
+    assert branch.state()["line"] is None
+    assert branch.state()["breakpoints"] == [5]
+    assert branch.bp_migrations[0]["oldLine"] == 4
+    assert branch.bp_migrations[0]["newLine"] == 5
+    # Parent keeps its own pause position and old breakpoints.
+    assert parent.state()["line"] == 4
+    assert parent.state()["breakpoints"] == [4]
+
+
+def test_compare_finds_first_variable_divergence():
+    base = DebugSession(RECURSIVE)
+    edited = DebugSession(RECURSIVE.replace("n * 10", "n * 20"))
+    result = base.compare(edited)
+    assert result["diverged"] is True
+    assert result["reason"] == "variables"
+    assert result["sameRevision"] is False
+    left_top = result["left"]["event"]["stack"][-1]
+    right_top = result["right"]["event"]["stack"][-1]
+    # First difference is local = n * 10 vs n * 20 inside fact.
+    assert {v["name"]: v["value"]["display"] for v in left_top["locals"]}["local"] == "30"
+    assert {v["name"]: v["value"]["display"] for v in right_top["locals"]}["local"] == "60"
+    # Each side reports which program revision its record belongs to.
+    assert result["left"]["sourceHash"] == base.source_hash
+    assert result["right"]["sourceHash"] == edited.source_hash
+    assert result["left"]["event"]["sourceHash"] == base.source_hash
+
+
+def test_compare_finds_output_divergence_and_identical_traces():
+    a = DebugSession("print(1)\n")
+    b = DebugSession("print(2)\n")
+    result = a.compare(b)
+    assert result["diverged"] is True
+    assert result["reason"] == "output"
+    same = a.compare(DebugSession("print(1)\n"))
+    assert same["diverged"] is False
+
+
+def test_branches_survive_save_and_reopen(tmp_path):
+    store = SessionStore(directory=tmp_path)
+    parent = store.create(RECURSIVE)
+    parent.set_breakpoints([2])
+    parent.continue_()
+    parent.continue_()
+    store.touch(parent)
+    edited = RECURSIVE.replace("n * 10", "n * 20")
+    branch = parent.fork(
+        source=edited,
+        name="乘20",
+        breakpoints=[2],
+        bp_migrations=[{"oldLine": 2, "newLine": 2,
+                        "fromHash": parent.source_hash,
+                        "toHash": source_hash(edited)}],
+    )
+    store.register(branch)
+    branch.continue_()
+    store.touch(branch)
+    branch_line = branch.state()["line"]
+
+    fresh = SessionStore(directory=tmp_path)
+    reopened_parent = fresh.get(parent.id)
+    reopened_branch = fresh.get(branch.id)
+    # Each branch resumes its own unfinished execution independently.
+    assert len(reopened_parent.state()["stack"]) == 3
+    assert reopened_branch.state()["line"] == branch_line
+    assert reopened_branch.state()["source"] == edited
+    assert reopened_branch.parent_id == parent.id
+    assert reopened_branch.name == "乘20"
+    # Confirmed breakpoint migration relations are preserved.
+    assert reopened_branch.bp_migrations[0]["oldLine"] == 2
+    assert reopened_branch.bp_migrations[0]["toHash"] == source_hash(edited)
+    # Stepping one reopened branch does not move the other.
+    reopened_branch.step_into()
+    assert reopened_parent.state()["line"] != reopened_branch.state()["line"] or \
+        reopened_parent.cursor != reopened_branch.cursor
+
+    listed = {item["id"]: item for item in fresh.list_saved()}
+    assert listed[branch.id]["parentId"] == parent.id
+    assert listed[branch.id]["name"] == "乘20"

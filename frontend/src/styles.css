@@ -91,3 +91,18 @@ aside {
 }
 .error-panel { border-color: #7a3434; }
 .err-msg { color: #ff8a8a; font-size: 13px; }
+.branch {
+  display: flex; flex-direction: column; padding: 5px 8px;
+  border-radius: 5px; cursor: pointer; font-size: 13px;
+}
+.branch:hover { background: #30323a; }
+.branch.selected { background: #34507a; }
+.migrations { margin-top: 8px; border-top: 1px solid #3a3b42; padding-top: 6px; }
+.compare-controls { display: flex; gap: 6px; margin-bottom: 8px; }
+.compare-controls select {
+  flex: 1; background: #1b1c21; color: #ddd; border: 1px solid #3a3b42;
+  border-radius: 5px; padding: 4px;
+}
+.compare-result { font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
+.compare-side { background: #1b1c21; border-radius: 5px; padding: 6px 8px; }
+.revision-note { color: #e0b56a; font-size: 12px; }
