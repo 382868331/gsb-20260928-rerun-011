@@ -65,15 +65,55 @@ export interface CompareSide {
   name: string;
   sourceHash: string;
   event: CompareEvent | null;
+  boundary: number | null;
+  executedCount: number;
+  waiting: boolean;
+}
+
+export interface BoundaryState {
+  id: string;
+  name: string;
+  sourceHash: string;
+  boundary: number;
+  line: number | null;
+  kind: string;
+  output: string;
+  stack: FrameSnapshot[];
+}
+
+export interface CompareSummary {
+  id: string;
+  createdAt: number;
+  leftId: string;
+  rightId: string;
+  status: "identical" | "waiting" | "diverged";
+  reason: "variables" | "output" | "kind" | "ahead" | null;
+  index: number | null;
+  sameRevision: boolean;
+  leftBoundary: number;
+  rightBoundary: number;
+}
+
+export interface CompareRecord {
+  id: string;
+  createdAt: number;
+  leftId: string;
+  rightId: string;
+  result: CompareResult;
+  leftState: BoundaryState;
+  rightState: BoundaryState;
 }
 
 export interface CompareResult {
   diverged: boolean;
+  status: "identical" | "waiting" | "diverged";
   index: number | null;
-  reason: "variables" | "output" | "kind" | "length" | null;
+  reason: "variables" | "output" | "kind" | "ahead" | null;
   sameRevision: boolean;
   left: CompareSide;
   right: CompareSide;
+  ahead: "left" | "right" | null;
+  aheadEvents: CompareEvent[];
 }
 
 export interface MigrationCandidate {
@@ -134,6 +174,21 @@ export const api = {
     }),
   compare: (id: string, otherId: string) =>
     request<CompareResult>(`/api/sessions/${id}/compare/${otherId}`),
+  compareSave: (
+    id: string,
+    otherId: string,
+    body: { leftCursor?: number; rightCursor?: number }
+  ) =>
+    request<CompareRecord>(`/api/sessions/${id}/compare/${otherId}`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  comparisons: (sessionId?: string) =>
+    request<{ comparisons: CompareSummary[] }>(
+      `/api/comparisons${sessionId ? `?session=${sessionId}` : ""}`
+    ),
+  comparison: (recordId: string) =>
+    request<CompareRecord>(`/api/comparisons/${recordId}`),
   step: (id: string, mode: "into" | "over") =>
     request<SessionState>(`/api/sessions/${id}/step`, {
       method: "POST",

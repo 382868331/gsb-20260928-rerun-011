@@ -279,10 +279,32 @@ class DebugSession:
             ],
         }
 
-    def compare(self, other: "DebugSession") -> dict:
-        """Find the first event where two branches' execution facts differ."""
+    def compare(
+        self,
+        other: "DebugSession",
+        left_cursor: int | None = None,
+        right_cursor: int | None = None,
+    ) -> dict:
+        """Compare only what the two branches have *actually executed*.
+
+
+        Each side is bounded by its own pause cursor: events the branch has
+        not reached yet are never treated as facts, so two sessions that
+        merely know different things about the future cannot report a
+        divergence. The branches are not required to walk in lockstep --
+        when the common executed prefix agrees, events executed only by the
+        longer side are reported as ``ahead`` while the other side is
+        ``waiting``; an incomplete comparison is never advertised as
+        identical.
+
+        ``left_cursor`` / ``right_cursor`` optionally select previously
+        saved pause boundaries for each side independently and are clamped
+        to that side's actual reach, so a later continuation can never
+        retroactively change an older comparison.
+        """
         result = {
             "diverged": False,
+            "status": "identical",
             "index": None,
             "reason": None,
             "sameRevision": self.source_hash == other.source_hash,
@@ -290,14 +312,22 @@ class DebugSession:
                 "id": self.id,
                 "name": self.name,
                 "sourceHash": self.source_hash,
+                "boundary": None,
+                "executedCount": 0,
                 "event": None,
+                "waiting": False,
             },
             "right": {
                 "id": other.id,
                 "name": other.name,
                 "sourceHash": other.source_hash,
+                "boundary": None,
+                "executedCount": 0,
                 "event": None,
+                "waiting": False,
             },
+            "ahead": None,
+            "aheadEvents": [],
         }
 
         def brief(session, event):
@@ -313,7 +343,18 @@ class DebugSession:
                 "message": event.get("message"),
             }
 
-        common = min(len(self.events), len(other.events))
+        left_cursor = self._compare_boundary(left_cursor)
+        right_cursor = other._compare_boundary(right_cursor)
+        # Executed facts are events with index 0..cursor inclusive. A
+        # session still before its first line has executed zero events.
+        left_executed = max(0, left_cursor + 1)
+        right_executed = max(0, right_cursor + 1)
+        result["left"]["boundary"] = left_cursor
+        result["right"]["boundary"] = right_cursor
+        result["left"]["executedCount"] = left_executed
+        result["right"]["executedCount"] = right_executed
+
+        common = min(left_executed, right_executed)
         for i in range(common):
             left_fact = self._event_fact(self.events[i])
             right_fact = self._event_fact(other.events[i])
@@ -325,20 +366,90 @@ class DebugSession:
                 reason = "output"
             else:
                 reason = "variables"
-            result.update({"diverged": True, "index": i, "reason": reason})
+            result.update(
+                {"diverged": True, "status": "diverged", "index": i, "reason": reason}
+            )
             result["left"]["event"] = brief(self, self.events[i])
             result["right"]["event"] = brief(other, other.events[i])
             return result
-        if len(self.events) != len(other.events):
-            longer = self if len(self.events) > len(other.events) else other
-            result.update({"diverged": True, "index": common, "reason": "length"})
-            result["left"]["event"] = brief(
-                self, self.events[common] if longer is self else None
-            )
-            result["right"]["event"] = brief(
-                other, other.events[common] if longer is other else None
-            )
+        if left_executed != right_executed:
+            # One branch has executed strictly more real events. That is
+            # not a divergence: the shorter side simply has not reached
+            # those points yet. Record the side that walked further and
+            # every event the other side has not lived through.
+            if left_executed > right_executed:
+                longer_session, longer_name = self, "left"
+                longer_cursor = left_cursor
+            else:
+                longer_session, longer_name = other, "right"
+                longer_cursor = right_cursor
+            result["status"] = "waiting"
+            result["reason"] = "ahead"
+            result["ahead"] = longer_name
+            result["aheadEvents"] = [
+                brief(longer_session, longer_session.events[i])
+                for i in range(common, longer_cursor + 1)
+            ]
+            result["left"]["waiting"] = left_executed < right_executed
+            result["right"]["waiting"] = right_executed < left_executed
         return result
+
+    def compare_record(
+        self,
+        other: "DebugSession",
+        left_cursor: int | None = None,
+        right_cursor: int | None = None,
+    ) -> dict:
+        """Build an immutable snapshot comparison at saved pause boundaries.
+
+        The returned dict captures the exact boundaries and both program
+        revisions, plus both sessions' full state at the divergence point,
+        so it can be persisted and revisited even after one side keeps
+        running or is deleted.
+        """
+        result = self.compare(other, left_cursor=left_cursor, right_cursor=right_cursor)
+        record = {
+            "id": uuid.uuid4().hex[:12],
+            "createdAt": time.time(),
+            "leftId": self.id,
+            "rightId": other.id,
+            "result": result,
+            "leftState": self._boundary_state(result["left"]["boundary"]),
+            "rightState": other._boundary_state(result["right"]["boundary"]),
+        }
+        return record
+
+    def _boundary_state(self, cursor: int) -> dict:
+        """Session facts as they were at a previously chosen boundary."""
+        if cursor is None or cursor < 0:
+            event = {"index": -1, "kind": "start", "line": None,
+                     "output": "", "stack": []}
+        else:
+            event = self.events[cursor]
+        return {
+            "id": self.id,
+            "name": self.name,
+            "sourceHash": self.source_hash,
+            "boundary": -1 if cursor is None else cursor,
+            "line": event.get("line"),
+            "kind": event.get("kind"),
+            "output": event.get("output", ""),
+            "stack": event.get("stack", []),
+        }
+
+    def _compare_boundary(self, requested) -> int:
+        """Normalize a chosen pause boundary to an actually reached cursor.
+
+        A boundary past where the branch has genuinely executed cannot be
+        selected: the future trace is not an execution fact, so such a
+        request clamps down to the current cursor.
+        """
+        last = len(self.events) - 1
+        if requested is None or not isinstance(requested, int):
+            cursor = self.cursor
+        else:
+            cursor = min(requested, self.cursor)
+        return max(-1, min(cursor, last))
 
     # ---- state ----
 
@@ -481,3 +592,79 @@ class SessionStore:
 
     def list_saved(self) -> list[dict]:
         return DebugSession.list_saved(self.directory)
+
+
+COMPARISONS_DIR = SESSIONS_DIR.parent / "comparisons"
+
+
+class ComparisonStore:
+    """Persists immutable comparison snapshots.
+
+    A comparison is a fact about the pause boundaries that existed when it
+    was made. Continuing either branch afterwards creates a *new*
+    comparison record; old ones keep their boundaries and still link back
+    to each side's variables, call site and program revision. Deleting a
+    branch never rewrites or removes its comparisons.
+    """
+
+    def __init__(self, directory: Path = COMPARISONS_DIR):
+        self.directory = directory
+        self.records: dict[str, dict] = {}
+
+    def add(self, record: dict) -> dict:
+        self.records[record["id"]] = record
+        self._write(record)
+        return record
+
+    def get(self, record_id: str) -> dict:
+        if record_id in self.records:
+            return self.records[record_id]
+        path = self.directory / f"{record_id}.json"
+        record = json.loads(path.read_text())
+        self.records[record_id] = record
+        return record
+
+    def list_all(self) -> list[dict]:
+        if not self.directory.exists():
+            return []
+        items = []
+        for path in sorted(self.directory.glob("*.json")):
+            try:
+                record = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            self.records.setdefault(record["id"], record)
+            items.append(self._summary(record))
+        for record in self.records.values():
+            if not any(item["id"] == record["id"] for item in items):
+                items.append(self._summary(record))
+        items.sort(key=lambda item: item["createdAt"])
+        return items
+
+    def list_for(self, session_id: str) -> list[dict]:
+        return [
+            item
+            for item in self.list_all()
+            if session_id in (item["leftId"], item["rightId"])
+        ]
+
+    def _write(self, record: dict) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / f"{record['id']}.json"
+        path.write_text(json.dumps(record, ensure_ascii=False, indent=2))
+
+    @staticmethod
+    def _summary(record: dict) -> dict:
+        result = record["result"]
+        return {
+            "id": record["id"],
+            "createdAt": record["createdAt"],
+            "leftId": record["leftId"],
+            "rightId": record["rightId"],
+            "status": result["status"],
+            "reason": result["reason"],
+            "index": result["index"],
+            "sameRevision": result["sameRevision"],
+            "leftBoundary": result["left"]["boundary"],
+            "rightBoundary": result["right"]["boundary"],
+        }

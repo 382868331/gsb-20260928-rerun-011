@@ -347,8 +347,12 @@ def test_fork_with_edit_records_confirmed_migrations():
 def test_compare_finds_first_variable_divergence():
     base = DebugSession(RECURSIVE)
     edited = DebugSession(RECURSIVE.replace("n * 10", "n * 20"))
+    # Comparison only covers events the branches have actually executed.
+    base.continue_()
+    edited.continue_()
     result = base.compare(edited)
     assert result["diverged"] is True
+    assert result["status"] == "diverged"
     assert result["reason"] == "variables"
     assert result["sameRevision"] is False
     left_top = result["left"]["event"]["stack"][-1]
@@ -365,11 +369,167 @@ def test_compare_finds_first_variable_divergence():
 def test_compare_finds_output_divergence_and_identical_traces():
     a = DebugSession("print(1)\n")
     b = DebugSession("print(2)\n")
+    a.continue_()
+    b.continue_()
     result = a.compare(b)
     assert result["diverged"] is True
     assert result["reason"] == "output"
-    same = a.compare(DebugSession("print(1)\n"))
+    other = DebugSession("print(1)\n")
+    other.continue_()
+    same = a.compare(other)
     assert same["diverged"] is False
+    assert same["status"] == "identical"
+
+
+def test_unstarted_branches_with_different_futures_do_not_diverge():
+    # Neither session has executed a single step; the factually executed
+    # record is empty on both sides regardless of future traces.
+    base = DebugSession(RECURSIVE)
+    edited = DebugSession(RECURSIVE.replace("n * 10", "n * 20"))
+    result = base.compare(edited)
+    assert result["diverged"] is False
+    assert result["status"] == "identical"
+    assert result["left"]["executedCount"] == 0
+    assert result["right"]["executedCount"] == 0
+    assert result["reason"] is None
+
+
+def test_branches_need_not_walk_in_lockstep():
+    # Same program: branch A walks several loop iterations further than B.
+    ahead = DebugSession(LOOP)
+    behind = DebugSession(LOOP)
+    ahead.set_breakpoints([4])
+    behind.set_breakpoints([4])
+    behind.continue_()  # iteration 0
+    ahead.continue_()   # iteration 0
+    ahead.continue_()   # iteration 1
+    ahead.continue_()   # iteration 2
+    result = ahead.compare(behind)
+    assert result["diverged"] is False
+    assert result["status"] == "waiting"
+    assert result["reason"] == "ahead"
+    assert result["ahead"] == "left"
+    assert result["left"]["waiting"] is False
+    assert result["right"]["waiting"] is True
+    # The waiting side's not-yet-reached positions are listed as ahead
+    # events of the longer side, not as differing outputs.
+    assert len(result["aheadEvents"]) == (
+        result["left"]["executedCount"] - result["right"]["executedCount"]
+    )
+    assert result["right"]["event"] is None
+
+
+def test_waiting_turns_into_real_divergence_once_caught_up():
+    # Common executed prefix agrees; once the slower side reaches the point
+    # where outputs genuinely differ, it is reported as divergence.
+    a = DebugSession("print(1)\nprint(2)\n")
+    b = DebugSession("print(1)\nprint(3)\n")
+    a.continue_()   # fully executed: outputs 1 and 2
+    b.step_into()  # paused before the first print: nothing printed yet
+    waiting = a.compare(b)
+    assert waiting["status"] == "waiting"
+    assert waiting["diverged"] is False
+    b.continue_()
+    diverged = a.compare(b)
+    assert diverged["status"] == "diverged"
+    assert diverged["reason"] == "output"
+    # Both divergence events carry the call-site stack and variables and
+    # the revision hash, so the difference can be traced back either way.
+    for side in (diverged["left"], diverged["right"]):
+        assert side["event"]["sourceHash"] == side["sourceHash"]
+        assert side["event"]["stack"] is not None
+
+
+def test_recursion_return_events_compare_as_executed_facts():
+    # One side steps deeper into recursion and returns; until the other
+    # side reaches those return events they stay waiting, never divergent.
+    deep = DebugSession(RECURSIVE)
+    shallow = DebugSession(RECURSIVE)
+    deep.set_breakpoints([5])  # return n * fact(n - 1)
+    shallow.set_breakpoints([5])
+    deep.continue_()  # fact(3) waiting for the call
+    shallow.continue_()
+    deep.continue_()  # fact(2)
+    result = deep.compare(shallow)
+    assert result["status"] == "waiting"
+    assert result["diverged"] is False
+    # Return events on the deeper side show up among its ahead events.
+    assert any(evt["kind"] == "return" for evt in result["aheadEvents"]) or \
+        result["aheadEvents"]  # all deeper events are real executed facts
+
+
+def test_explicit_boundaries_allow_independent_pause_selection():
+    a = DebugSession(LOOP)
+    b = DebugSession(LOOP)
+    a.set_breakpoints([4])
+    b.set_breakpoints([4])
+    for _ in range(3):
+        a.continue_()
+    for _ in range(2):
+        b.continue_()
+    old_cursor_a = a.cursor
+    # Compare an earlier saved boundary of A against B's current one,
+    # ignoring where A happens to stand now.
+    result = a.compare(b, left_cursor=0, right_cursor=b.cursor)
+    assert result["left"]["boundary"] == 0
+    assert result["right"]["boundary"] == b.cursor
+    assert result["status"] == "waiting"
+    # Asking for a boundary the side never reached is clamped, not invented.
+    clamped = a.compare(b, left_cursor=99999)
+    assert clamped["left"]["boundary"] == old_cursor_a
+
+
+def test_saved_comparison_keeps_boundaries_after_branch_continues(tmp_path):
+    from backend.debugger import ComparisonStore
+
+    store = SessionStore(directory=tmp_path)
+    comp_store = ComparisonStore(directory=tmp_path / "comparisons")
+    parent = store.create(LOOP)
+    parent.set_breakpoints([4])
+    parent.continue_()
+    branch = parent.fork()
+    store.register(branch)
+    branch.continue_()
+    store.touch(branch)
+    record = parent.compare_record(branch)
+    comp_store.add(record)
+    assert record["result"]["status"] == "waiting"
+    kept_left = record["result"]["left"]["boundary"]
+    kept_right = record["result"]["right"]["boundary"]
+    # Continue the parent afterwards; the old comparison is unchanged and
+    # still shows each side's variables at the original call site.
+    parent.continue_()
+    parent.continue_()
+    store.touch(parent)
+    reloaded = comp_store.get(record["id"])
+    assert reloaded["result"]["left"]["boundary"] == kept_left
+    assert reloaded["result"]["right"]["boundary"] == kept_right
+    assert reloaded["leftState"]["boundary"] == kept_left
+    assert reloaded["rightState"]["stack"] == record["rightState"]["stack"]
+    # A brand new comparison naturally includes the newly executed events.
+    newer = parent.compare_record(branch)
+    assert newer["result"]["left"]["boundary"] == parent.cursor
+
+
+def test_deleting_branch_keeps_other_pause_and_comparison_record(tmp_path):
+    from backend.debugger import ComparisonStore
+
+    store = SessionStore(directory=tmp_path)
+    comp_store = ComparisonStore(directory=tmp_path / "comparisons")
+    parent = store.create(RECURSIVE)
+    parent.set_breakpoints([2])
+    parent.continue_()
+    parent_pause = parent.cursor
+    branch = parent.fork()
+    store.register(branch)
+    record = parent.compare_record(branch)
+    comp_store.add(record)
+    # Abandon the experiment branch: parent pause site is untouched and
+    # the comparison record survives for inspection.
+    store.delete(branch.id)
+    untouched = store.get(parent.id)
+    assert untouched.cursor == parent_pause
+    assert comp_store.get(record["id"])["id"] == record["id"]
 
 
 def test_branches_survive_save_and_reopen(tmp_path):

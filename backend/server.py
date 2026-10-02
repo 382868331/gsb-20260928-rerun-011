@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .debugger import SessionStore, SourceError
+from .debugger import ComparisonStore, SessionStore, SourceError
 
 app = FastAPI(title="MiniLang 可视化调试器")
 app.add_middleware(
@@ -19,6 +19,7 @@ app.add_middleware(
 )
 
 store = SessionStore()
+comparisons = ComparisonStore()
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
@@ -45,6 +46,13 @@ class ForkBody(BaseModel):
     name: str | None = None
     breakpoints: list[int] = []
     bpMigrations: list[dict] = []
+
+
+class CompareBody(BaseModel):
+    # Independently chosen, already saved pause boundaries. Omitted means
+    # "use the boundary this branch is currently paused at".
+    leftCursor: int | None = None
+    rightCursor: int | None = None
 
 
 def _get(session_id: str):
@@ -129,6 +137,38 @@ def compare(session_id: str, other_id: str):
     left = _get(session_id)
     right = _get(other_id)
     return left.compare(right)
+
+
+@app.post("/api/sessions/{session_id}/compare/{other_id}")
+def compare_save(session_id: str, other_id: str, body: CompareBody):
+    """Persist a comparison at two independently selected pause boundaries.
+
+    The snapshot is immutable: continuing either branch later leaves this
+    record at its original boundaries.
+    """
+    left = _get(session_id)
+    right = _get(other_id)
+    record = left.compare_record(
+        right,
+        left_cursor=body.leftCursor,
+        right_cursor=body.rightCursor,
+    )
+    comparisons.add(record)
+    return record
+
+
+@app.get("/api/comparisons")
+def list_comparisons(session: str | None = None):
+    records = comparisons.list_for(session) if session else comparisons.list_all()
+    return {"comparisons": records}
+
+
+@app.get("/api/comparisons/{record_id}")
+def get_comparison(record_id: str):
+    try:
+        return comparisons.get(record_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="比较记录不存在")
 
 
 @app.put("/api/sessions/{session_id}/breakpoints")

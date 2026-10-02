@@ -3,6 +3,8 @@ import {
   api,
   BranchInfo,
   BpMigration,
+  CompareRecord,
+  CompareSummary,
   CompareResult,
   MigrationPreview,
   SessionState,
@@ -27,7 +29,7 @@ const REASON_LABEL: Record<string, string> = {
   variables: "变量值不同",
   output: "输出不同",
   kind: "事件类型不同",
-  length: "一侧执行已结束",
+  ahead: "一边先行，另一边尚未到达",
 };
 
 export default function App() {
@@ -47,7 +49,8 @@ export default function App() {
   const [forkMode, setForkMode] = useState(false);
   const [branches, setBranches] = useState<BranchInfo[]>([]);
   const [compareTarget, setCompareTarget] = useState<string>("");
-  const [compareResult, setCompareResult] = useState<CompareResult | null>(null);
+  const [compareRecord, setCompareRecord] = useState<CompareRecord | null>(null);
+  const [comparisonList, setComparisonList] = useState<CompareSummary[]>([]);
 
   const dirty = useMemo(
     () => session !== null && source !== session.source,
@@ -66,6 +69,12 @@ export default function App() {
     } catch {
       // 列表刷新失败不影响调试主流程。
     }
+    try {
+      const res = await api.comparisons();
+      setComparisonList(res.comparisons);
+    } catch {
+      // 历史比较加载失败不影响调试主流程。
+    }
   }
 
   useEffect(() => {
@@ -78,7 +87,6 @@ export default function App() {
     try {
       const state = await action();
       setSession(state);
-      setCompareResult(null);
       refreshBranches();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -199,7 +207,7 @@ export default function App() {
       const parent = await api.get(parentId);
       setSession(parent);
       setSource(parent.source);
-      setCompareResult(null);
+      setCompareRecord(null);
       setNotice("已放弃实验分支，回到原暂停现场。");
       refreshBranches();
     } catch (e) {
@@ -225,7 +233,20 @@ export default function App() {
     if (!session || !compareTarget) return;
     setError("");
     try {
-      setCompareResult(await api.compare(session.id, compareTarget));
+      // Persist at each side's currently saved pause boundary. Older
+      // records keep their old boundaries even after either side runs on.
+      const record = await api.compareSave(session.id, compareTarget, {});
+      setCompareRecord(record);
+      refreshBranches();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function openComparison(summary: CompareSummary) {
+    setError("");
+    try {
+      setCompareRecord(await api.comparison(summary.id));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -445,70 +466,50 @@ export default function App() {
                   ))}
               </select>
               <button onClick={runCompare} disabled={!session || !compareTarget}>
-                比较
+                比较已保存边界
               </button>
             </div>
-            {compareResult && (
-              <div className="compare-result">
-                {!compareResult.diverged && (
-                  <div className="empty">两侧执行事实完全一致。</div>
-                )}
-                {compareResult.diverged && (
-                  <>
-                    <div>
-                      首次不同：第 {compareResult.index} 个事件（
-                      {REASON_LABEL[compareResult.reason ?? ""]}）
+            <div className="fline">
+              只比较双方已经实际执行到的暂停边界；未运行到的部分标为等待，单步/继续不会改动旧比较。
+            </div>
+            {comparisonList.length > 0 && (
+              <div className="compare-history">
+                <h3>已保存的比较</h3>
+                {[...comparisonList].reverse().map((item) => {
+                  const nameOf = (id: string) =>
+                    branches.find((b) => b.id === id)?.name ||
+                    (id === session?.id ? session.name : "已删除分支");
+                  const label =
+                    item.status === "diverged"
+                      ? `分歧 · ${REASON_LABEL[item.reason ?? ""] ?? item.reason}`
+                      : item.status === "waiting"
+                      ? "等待（一边先行）"
+                      : "公共部分一致";
+                  return (
+                    <div
+                      key={item.id}
+                      className={`compare-history-row status-${item.status}`}
+                      onClick={() => openComparison(item)}
+                    >
+                      <span className="fname">{label}</span>
+                      <span className="fline">
+                        {nameOf(item.leftId)}@{item.leftBoundary} ↔
+                        {" "}{nameOf(item.rightId)}@{item.rightBoundary}
+                        {!item.sameRevision && " · 不同修订"}
+                      </span>
                     </div>
-                    {!compareResult.sameRevision && (
-                      <div className="revision-note">
-                        两侧记录来自不同程序修订（
-                        {compareResult.left.sourceHash.slice(0, 6)} vs{" "}
-                        {compareResult.right.sourceHash.slice(0, 6)}
-                        ），相同行号不代表同一步。
-                      </div>
-                    )}
-                    {([compareResult.left, compareResult.right] as const).map(
-                      (side, i) => (
-                        <div key={i} className="compare-side">
-                          <div className="fname">
-                            {side.name} · 修订 {side.sourceHash.slice(0, 6)}
-                          </div>
-                          {side.event ? (
-                            <>
-                              <div className="fline">
-                                事件 {side.event.kind}
-                                {side.event.line != null &&
-                                  ` · 第 ${side.event.line} 行`}
-                                {side.event.message &&
-                                  ` · ${side.event.message}`}
-                              </div>
-                              {side.event.stack.length > 0 && (
-                                <div className="fline">
-                                  {side.event.stack[
-                                    side.event.stack.length - 1
-                                  ].locals
-                                    .map(
-                                      (v) =>
-                                        `${v.name}=${v.value.display}`
-                                    )
-                                    .join("，") || "（无局部变量）"}
-                                </div>
-                              )}
-                              {side.event.output && (
-                                <pre className="output">
-                                  {side.event.output}
-                                </pre>
-                              )}
-                            </>
-                          ) : (
-                            <div className="fline">（该侧已无更多事件）</div>
-                          )}
-                        </div>
-                      )
-                    )}
-                  </>
-                )}
+                  );
+                })}
               </div>
+            )}
+            {compareRecord && (
+              <CompareDetail
+                record={compareRecord}
+                nameOf={(id) =>
+                  branches.find((b) => b.id === id)?.name ||
+                  (id === session?.id ? session.name : id)
+                }
+              />
             )}
           </section>
 
@@ -567,5 +568,128 @@ export default function App() {
         </aside>
       </main>
     </div>
+  );
+}
+
+function CompareDetail({
+  record,
+  nameOf,
+}: {
+  record: CompareRecord;
+  nameOf: (id: string) => string;
+}) {
+  const { result } = record;
+  return (
+    <div className="compare-result">
+      {result.status === "identical" && (
+        <div className="empty">
+          两侧已实际执行的公共部分（各 {result.left.executedCount} 个事件）事实一致。
+        </div>
+      )}
+      {result.status === "waiting" && (
+        <div className="status-waiting">
+          {result.ahead === "left" ? "左" : "右"}侧先行（
+          {result.ahead === "left"
+            ? result.left.executedCount
+            : result.right.executedCount}
+          个事件），
+          {result.ahead === "left" ? "右" : "左"}侧仅执行 {" "}
+          {result.ahead === "left"
+            ? result.right.executedCount
+            : result.left.executedCount}{" "}
+          个事件，尚未到达的位置标为等待——这不是分歧。
+        </div>
+      )}
+      {result.status === "diverged" && (
+        <div className="status-diverged">
+          首次不同：公共执行中的第 {result.index} 个事件（
+          {REASON_LABEL[result.reason ?? ""]}）。
+        </div>
+      )}
+      {!result.sameRevision && (
+        <div className="revision-note">
+          两侧记录来自不同程序修订（
+          {result.left.sourceHash.slice(0, 6)} vs {" "}
+          {result.right.sourceHash.slice(0, 6)}），相同行号不代表同一执行事件。
+        </div>
+      )}
+      {([
+        { side: result.left, state: record.leftState, i: 0 },
+        { side: result.right, state: record.rightState, i: 1 },
+      ] as const).map(({ side, state, i }) => (
+        <div key={i} className="compare-side">
+          <div className="fname">
+            {nameOf(side.id)} · 修订 {side.sourceHash.slice(0, 6)} ·
+            边界事件 {side.boundary}
+            {side.waiting && <span className="tag-waiting">等待中</span>}
+          </div>
+          {side.event ? (
+            <BoundaryEvent
+              event={side.event}
+              waiting={side.waiting}
+              ahead={result.ahead === (i === 0 ? "left" : "right")}
+            />
+          ) : result.status === "waiting" &&
+            result.ahead === (i === 0 ? "right" : "left") ? (
+            <div className="fline">
+              （等待：该侧尚未执行到这些位置；当前停在 {state.kind}
+              {state.line != null && ` · 第 ${state.line} 行`}）
+            </div>
+          ) : (
+            <div className="fline">
+              （{state.kind}
+              {state.line != null && ` · 第 ${state.line} 行`}）
+            </div>
+          )}
+        </div>
+      ))}
+      {result.status === "waiting" && result.aheadEvents.length > 0 && (
+        <div className="ahead-events">
+          <h3>先行侧独有事件（另一侧等待）</h3>
+          {result.aheadEvents.map((evt) => (
+            <div key={evt.index} className="ahead-event">
+              <BoundaryEvent event={evt} waiting={false} ahead />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BoundaryEvent({
+  event,
+  waiting,
+  ahead,
+}: {
+  event: NonNullable<CompareResult["left"]["event"]>;
+  waiting: boolean;
+  ahead: boolean;
+}) {
+  return (
+    <>
+      <div className="fline">
+        事件 #{event.index} · {event.kind}
+        {event.line != null && ` · 第 ${event.line} 行`}
+        {event.message && ` · ${event.message}`}
+        {waiting && <span className="tag-waiting"> 等待</span>}
+        {ahead && <span className="tag-ahead"> 先行</span>}
+      </div>
+      {event.stack.length > 0 && (
+        <div className="compare-frames">
+          {event.stack.map((frame, fi) => (
+            <div key={frame.uid} className="fline">
+              #{fi} {frame.name}（第 {frame.line} 行调用现场）：
+              {frame.locals.length === 0
+                ? "（无局部变量）"
+                : frame.locals
+                    .map((v) => `${v.name}=${v.value.display}`)
+                    .join("，")}
+            </div>
+          ))}
+        </div>
+      )}
+      {event.output && <pre className="output">{event.output}</pre>}
+    </>
   );
 }

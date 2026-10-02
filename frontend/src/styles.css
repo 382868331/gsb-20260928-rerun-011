@@ -106,3 +106,13 @@ aside {
 .compare-result { font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
 .compare-side { background: #1b1c21; border-radius: 5px; padding: 6px 8px; }
 .revision-note { color: #e0b56a; font-size: 12px; }
+
+.tag-waiting { color: #e0b56a; font-size: 11px; margin-left: 6px; }
+.tag-ahead { color: #7db4ff; font-size: 11px; margin-left: 6px; }
+.status-waiting { color: #e0b56a; }
+.status-diverged { color: #ff8a7a; }
+.compare-history { margin-top: 8px; }
+.compare-history-row { cursor: pointer; padding: 4px 6px; border-radius: 4px; }
+.compare-history-row:hover { background: #2a2c34; }
+.ahead-events h3, .compare-history h3 { margin: 8px 0 4px; font-size: 12px; }
+.compare-frames { margin: 2px 0; }
