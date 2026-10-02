@@ -106,3 +106,21 @@ aside {
 .compare-result { font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
 .compare-side { background: #1b1c21; border-radius: 5px; padding: 6px 8px; }
 .revision-note { color: #e0b56a; font-size: 12px; }
+.compare-boundaries {
+  display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px;
+}
+.boundary-pick {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 6px; color: #999; font-size: 12px;
+}
+.boundary-pick select {
+  flex: 1; max-width: 60%; background: #1b1c21; color: #ddd;
+  border: 1px solid #3a3b42; border-radius: 5px; padding: 3px;
+}
+.stale-note { color: #e0b56a; }
+.waiting-note { color: #7fa8d8; font-style: italic; }
+.frame-chip {
+  display: inline-block; margin-left: 4px; padding: 0 5px;
+  background: #2a2c34; border-radius: 4px; color: #9ecbff;
+  font-family: ui-monospace, monospace;
+}

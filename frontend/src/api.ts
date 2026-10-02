@@ -18,6 +18,7 @@ export interface FrameSnapshot {
 export interface SessionState {
   id: string;
   name: string;
+  cursor: number;
   parentId: string | null;
   forkCursor: number | null;
   bpMigrations: BpMigration[];
@@ -46,8 +47,15 @@ export interface BranchInfo {
   name: string | null;
   parentId: string | null;
   created_at: number | null;
+  cursor: number;
   sourceHash: string;
   preview: string[];
+}
+
+export interface PauseBoundary {
+  index: number;
+  line: number | null;
+  kind: string;
 }
 
 export interface CompareEvent {
@@ -64,13 +72,19 @@ export interface CompareSide {
   id: string;
   name: string;
   sourceHash: string;
+  boundary: number;
+  cursor: number;
+  executedCount: number;
+  stepCount: number;
+  terminal: boolean;
   event: CompareEvent | null;
 }
 
 export interface CompareResult {
+  status: "identical" | "waiting" | "ahead" | "diverged";
   diverged: boolean;
   index: number | null;
-  reason: "variables" | "output" | "kind" | "length" | null;
+  reason: "variables" | "output" | "kind" | "ahead" | null;
   sameRevision: boolean;
   left: CompareSide;
   right: CompareSide;
@@ -132,8 +146,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  compare: (id: string, otherId: string) =>
-    request<CompareResult>(`/api/sessions/${id}/compare/${otherId}`),
+  pauseBoundaries: (id: string) =>
+    request<{ id: string; cursor: number; boundaries: PauseBoundary[] }>(
+      `/api/sessions/${id}/pause-boundaries`
+    ),
+  compare: (
+    id: string,
+    otherId: string,
+    boundaries?: { leftBoundary?: number; rightBoundary?: number }
+  ) => {
+    const params = new URLSearchParams();
+    if (boundaries?.leftBoundary !== undefined)
+      params.set("leftBoundary", String(boundaries.leftBoundary));
+    if (boundaries?.rightBoundary !== undefined)
+      params.set("rightBoundary", String(boundaries.rightBoundary));
+    const query = params.toString();
+    return request<CompareResult>(
+      `/api/sessions/${id}/compare/${otherId}${query ? `?${query}` : ""}`
+    );
+  },
   step: (id: string, mode: "into" | "over") =>
     request<SessionState>(`/api/sessions/${id}/step`, {
       method: "POST",

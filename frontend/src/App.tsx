@@ -3,6 +3,7 @@ import {
   api,
   BranchInfo,
   BpMigration,
+  PauseBoundary,
   CompareResult,
   MigrationPreview,
   SessionState,
@@ -27,7 +28,7 @@ const REASON_LABEL: Record<string, string> = {
   variables: "变量值不同",
   output: "输出不同",
   kind: "事件类型不同",
-  length: "一侧执行已结束",
+  ahead: "一侧走得更远",
 };
 
 export default function App() {
@@ -48,6 +49,12 @@ export default function App() {
   const [branches, setBranches] = useState<BranchInfo[]>([]);
   const [compareTarget, setCompareTarget] = useState<string>("");
   const [compareResult, setCompareResult] = useState<CompareResult | null>(null);
+  // Independently chosen saved pause boundaries for the two sides.
+  // undefined = use each side's current cursor.
+  const [leftBoundary, setLeftBoundary] = useState<number | undefined>(undefined);
+  const [rightBoundary, setRightBoundary] = useState<number | undefined>(undefined);
+  const [leftBoundaries, setLeftBoundaries] = useState<PauseBoundary[]>([]);
+  const [rightBoundaries, setRightBoundaries] = useState<PauseBoundary[]>([]);
 
   const dirty = useMemo(
     () => session !== null && source !== session.source,
@@ -78,7 +85,9 @@ export default function App() {
     try {
       const state = await action();
       setSession(state);
-      setCompareResult(null);
+      // A displayed comparison stays pinned at its chosen boundaries:
+      // continuing one branch must not rewrite the old result; the
+      // comparison panel shows separately when either side moved on.
       refreshBranches();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -225,7 +234,36 @@ export default function App() {
     if (!session || !compareTarget) return;
     setError("");
     try {
-      setCompareResult(await api.compare(session.id, compareTarget));
+      const [leftB, rightB] = await Promise.all([
+        api.pauseBoundaries(session.id),
+        api.pauseBoundaries(compareTarget),
+      ]);
+      setLeftBoundaries(leftB.boundaries);
+      setRightBoundaries(rightB.boundaries);
+      setCompareResult(
+        await api.compare(session.id, compareTarget, {
+          leftBoundary,
+          rightBoundary,
+        })
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function chooseCompareTarget(id: string) {
+    setCompareTarget(id);
+    setCompareResult(null);
+    setLeftBoundary(undefined);
+    setRightBoundary(undefined);
+    if (!session || !id) return;
+    try {
+      const [leftB, rightB] = await Promise.all([
+        api.pauseBoundaries(session.id),
+        api.pauseBoundaries(id),
+      ]);
+      setLeftBoundaries(leftB.boundaries);
+      setRightBoundaries(rightB.boundaries);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -433,7 +471,7 @@ export default function App() {
             <div className="compare-controls">
               <select
                 value={compareTarget}
-                onChange={(e) => setCompareTarget(e.target.value)}
+                onChange={(e) => chooseCompareTarget(e.target.value)}
               >
                 <option value="">选择对比分支…</option>
                 {branches
@@ -448,15 +486,73 @@ export default function App() {
                 比较
               </button>
             </div>
+            {compareTarget && (
+              <div className="compare-boundaries">
+                <label className="boundary-pick">
+                  本侧暂停边界
+                  <select
+                    value={leftBoundary === undefined ? "" : String(leftBoundary)}
+                    onChange={(e) =>
+                      setLeftBoundary(
+                        e.target.value === ""
+                          ? undefined
+                          : Number(e.target.value)
+                      )
+                    }
+                  >
+                    <option value="">当前暂停位置</option>
+                    {leftBoundaries.map((b) => (
+                      <option key={b.index} value={b.index}>
+                        第 {b.line} 行（事件 {b.index}）
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="boundary-pick">
+                  对侧暂停边界
+                  <select
+                    value={rightBoundary === undefined ? "" : String(rightBoundary)}
+                    onChange={(e) =>
+                      setRightBoundary(
+                        e.target.value === ""
+                          ? undefined
+                          : Number(e.target.value)
+                      )
+                    }
+                  >
+                    <option value="">当前暂停位置</option>
+                    {rightBoundaries.map((b) => (
+                      <option key={b.index} value={b.index}>
+                        第 {b.line} 行（事件 {b.index}）
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            )}
             {compareResult && (
               <div className="compare-result">
-                {!compareResult.diverged && (
-                  <div className="empty">两侧执行事实完全一致。</div>
+                {compareResult.status === "identical" && (
+                  <div className="empty">
+                    两侧都已运行到结束，已执行部分的执行事实完全一致。
+                  </div>
                 )}
-                {compareResult.diverged && (
+                {compareResult.status === "waiting" && (
+                  <div className="empty">
+                    已执行的公共部分一致；至少一侧尚未运行到所选位置，
+                    后续部分标记为等待——不把尚未发生的未来行为当作事实。
+                  </div>
+                )}
+                {compareResult.status === "ahead" && (
+                  <div>
+                    公共已执行部分一致；一侧走得更远（多执行了循环/递归步），
+                    另一侧该位置尚未到达，并非输出或变量分歧。
+                  </div>
+                )}
+                {compareResult.status === "diverged" && (
                   <>
                     <div>
-                      首次不同：第 {compareResult.index} 个事件（
+                      首次不同：第 {compareResult.index} 个暂停步（
                       {REASON_LABEL[compareResult.reason ?? ""]}）
                     </div>
                     {!compareResult.sameRevision && (
@@ -473,6 +569,17 @@ export default function App() {
                           <div className="fname">
                             {side.name} · 修订 {side.sourceHash.slice(0, 6)}
                           </div>
+                          <div className="fline">
+                            比较边界：事件 {side.boundary}
+                            {side.boundary !== side.cursor && (
+                              <span className="stale-note">
+                                （该分支现已走到事件 {side.cursor}，本比较仍钉在旧边界）
+                              </span>
+                            )}
+                            {' · '}
+                            已执行 {side.executedCount} 个事件 / {side.stepCount} 个暂停步
+                            {side.terminal ? " · 已到终态" : " · 仍在等待"}
+                          </div>
                           {side.event ? (
                             <>
                               <div className="fline">
@@ -484,13 +591,22 @@ export default function App() {
                               </div>
                               {side.event.stack.length > 0 && (
                                 <div className="fline">
+                                  调用链：
+                                  {side.event.stack
+                                    .map((f, fi) => (
+                                      <span key={fi} className="frame-chip">
+                                        {f.name}@第{f.line}行
+                                      </span>
+                                    ))}
+                                </div>
+                              )}
+                              {side.event.stack.length > 0 && (
+                                <div className="fline">
+                                  当前帧变量：
                                   {side.event.stack[
                                     side.event.stack.length - 1
                                   ].locals
-                                    .map(
-                                      (v) =>
-                                        `${v.name}=${v.value.display}`
-                                    )
+                                    .map((v) => `${v.name}=${v.value.display}`)
                                     .join("，") || "（无局部变量）"}
                                 </div>
                               )}
@@ -501,7 +617,9 @@ export default function App() {
                               )}
                             </>
                           ) : (
-                            <div className="fline">（该侧已无更多事件）</div>
+                            <div className="fline waiting-note">
+                              （等待：该侧尚未执行到对应位置，未来事件不计入比较）
+                            </div>
                           )}
                         </div>
                       )

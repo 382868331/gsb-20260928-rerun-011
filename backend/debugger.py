@@ -279,9 +279,79 @@ class DebugSession:
             ],
         }
 
-    def compare(self, other: "DebugSession") -> dict:
-        """Find the first event where two branches' execution facts differ."""
+    def pause_boundaries(self) -> list[dict]:
+        """Saved pause boundaries the user may compare at.
+
+        Only positions already reached (index <= cursor) are offered;
+        future events are never presented as selectable facts.
+        """
+        boundaries = []
+        for event in self.events[: self.cursor + 1]:
+            if event["kind"] == "line":
+                boundaries.append({
+                    "index": event["index"],
+                    "line": event.get("line"),
+                    "kind": event["kind"],
+                })
+        return boundaries
+
+    def _executed_events(self, boundary: int) -> list[dict]:
+        """Events that have actually happened up to ``boundary`` (inclusive)."""
+        if boundary < 0:
+            return []
+        return self.events[: min(boundary, len(self.events) - 1) + 1]
+
+    def _executed_steps(self, boundary: int) -> list[dict]:
+        """User-visible pause steps that actually happened up to ``boundary``.
+
+        The steps a user can pause at are the ``line`` events; internal
+        events such as ``stmt_end``/``call``/``return`` are bookkeeping
+        between pauses and must not be aligned by raw event index, since
+        inserted lines or different call depth would then make the same
+        logical step look misaligned. Each step carries the cumulative
+        output and full stack snapshot observed at that pause. A terminal
+        ``error``/``end`` event is appended as the final step so program
+        exit and failure remain comparable facts.
+        """
+        steps = []
+        for event in self._executed_events(boundary):
+            if event["kind"] == "line":
+                steps.append(event)
+        if boundary >= len(self.events) - 1:
+            last = self.events[-1]
+            if last["kind"] in ("error", "end"):
+                steps.append(last)
+        return steps
+
+    def compare(
+        self,
+        other: "DebugSession",
+        left_boundary: int | None = None,
+        right_boundary: int | None = None,
+    ) -> dict:
+        """Compare two branches at independently chosen saved pause boundaries.
+
+        Defaults to each side's current cursor, so branches never have to
+        advance in lockstep. Events beyond a boundary have not run on that
+        side and are reported as "waiting", never as divergence; a side
+        that simply executed more is reported as "ahead". Line numbers
+        are not part of the compared facts (the same line number across
+        revisions is a different event); each reported event carries its
+        revision hash and full stack snapshot for tracing back to
+        variables, call site and program revision.
+        """
+        left_idx = self.cursor if left_boundary is None else left_boundary
+        right_idx = other.cursor if right_boundary is None else right_boundary
+        if not -1 <= left_idx <= self.cursor:
+            raise ValueError("左侧边界尚未执行，不能比较未来事件")
+        if not -1 <= right_idx <= other.cursor:
+            raise ValueError("右侧边界尚未执行，不能比较未来事件")
+
+        left_events = self._executed_steps(left_idx)
+        right_events = other._executed_steps(right_idx)
+
         result = {
+            "status": "identical",
             "diverged": False,
             "index": None,
             "reason": None,
@@ -290,12 +360,26 @@ class DebugSession:
                 "id": self.id,
                 "name": self.name,
                 "sourceHash": self.source_hash,
+                "boundary": left_idx,
+                "cursor": self.cursor,
+                "executedCount": len(self._executed_events(left_idx)),
+                "stepCount": len(left_events),
+                "terminal": bool(left_events) and left_events[-1]["kind"] in (
+                    "error", "end"
+                ),
                 "event": None,
             },
             "right": {
                 "id": other.id,
                 "name": other.name,
                 "sourceHash": other.source_hash,
+                "boundary": right_idx,
+                "cursor": other.cursor,
+                "executedCount": len(other._executed_events(right_idx)),
+                "stepCount": len(right_events),
+                "terminal": bool(right_events) and right_events[-1]["kind"] in (
+                    "error", "end"
+                ),
                 "event": None,
             },
         }
@@ -313,10 +397,18 @@ class DebugSession:
                 "message": event.get("message"),
             }
 
-        common = min(len(self.events), len(other.events))
+        def first_line_event(events, start):
+            """Next real pause point at/after ``start`` on the longer side."""
+            for event in events[start:]:
+                if event["kind"] == "line":
+                    return event
+            return events[start]
+
+        # Only the common executed prefix can be compared fact-to-fact.
+        common = min(len(left_events), len(right_events))
         for i in range(common):
-            left_fact = self._event_fact(self.events[i])
-            right_fact = self._event_fact(other.events[i])
+            left_fact = self._event_fact(left_events[i])
+            right_fact = self._event_fact(right_events[i])
             if left_fact == right_fact:
                 continue
             if left_fact["kind"] != right_fact["kind"]:
@@ -325,19 +417,45 @@ class DebugSession:
                 reason = "output"
             else:
                 reason = "variables"
-            result.update({"diverged": True, "index": i, "reason": reason})
-            result["left"]["event"] = brief(self, self.events[i])
-            result["right"]["event"] = brief(other, other.events[i])
+            result.update({
+                "status": "diverged",
+                "diverged": True,
+                "index": i,
+                "reason": reason,
+            })
+            result["left"]["event"] = brief(self, left_events[i])
+            result["right"]["event"] = brief(other, right_events[i])
             return result
-        if len(self.events) != len(other.events):
-            longer = self if len(self.events) > len(other.events) else other
-            result.update({"diverged": True, "index": common, "reason": "length"})
-            result["left"]["event"] = brief(
-                self, self.events[common] if longer is self else None
+        # The common executed prefix matches. If one side simply executed
+        # more events (more loop iterations, deeper recursion, or just
+        # further along), that is "ahead", not a factual difference.
+        if len(left_events) != len(right_events):
+            if len(left_events) > len(right_events):
+                longer_side, longer_session, longer_events = (
+                    result["left"], self, left_events
+                )
+            else:
+                longer_side, longer_session, longer_events = (
+                    result["right"], other, right_events
+                )
+            result.update({
+                "status": "ahead",
+                "reason": "ahead",
+                "index": common,
+            })
+            representative = first_line_event(longer_events, common)
+            longer_side["event"] = brief(
+                longer_session, representative
             )
-            result["right"]["event"] = brief(
-                other, other.events[common] if longer is other else None
-            )
+            return result
+
+        # Same number of executed events and equal facts, but at least one
+        # side has not reached its end: equality is provisional only, so
+        # report "waiting" instead of pretending the branches agree.
+        if not (
+            result["left"]["terminal"] and result["right"]["terminal"]
+        ):
+            result["status"] = "waiting"
         return result
 
     # ---- state ----
@@ -365,6 +483,7 @@ class DebugSession:
         state = {
             "id": self.id,
             "name": self.name,
+            "cursor": self.cursor,
             "parentId": self.parent_id,
             "forkCursor": self.fork_cursor,
             "bpMigrations": self.bp_migrations,
@@ -440,6 +559,7 @@ class DebugSession:
                 "id": record["id"],
                 "created_at": record.get("created_at"),
                 "name": record.get("name"),
+                "cursor": record.get("cursor", -1),
                 "parentId": record.get("parent_id"),
                 "sourceHash": source_hash(record.get("source", "")),
                 "preview": record.get("source", "").strip().splitlines()[:1],

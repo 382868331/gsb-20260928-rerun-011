@@ -347,6 +347,10 @@ def test_fork_with_edit_records_confirmed_migrations():
 def test_compare_finds_first_variable_divergence():
     base = DebugSession(RECURSIVE)
     edited = DebugSession(RECURSIVE.replace("n * 10", "n * 20"))
+    # Comparison only uses execution facts that have actually happened;
+    # both branches must run before any divergence can be reported.
+    base.continue_()
+    edited.continue_()
     result = base.compare(edited)
     assert result["diverged"] is True
     assert result["reason"] == "variables"
@@ -365,11 +369,145 @@ def test_compare_finds_first_variable_divergence():
 def test_compare_finds_output_divergence_and_identical_traces():
     a = DebugSession("print(1)\n")
     b = DebugSession("print(2)\n")
+    a.continue_()
+    b.continue_()
     result = a.compare(b)
     assert result["diverged"] is True
     assert result["reason"] == "output"
     same = a.compare(DebugSession("print(1)\n"))
+    # A freshly created counterpart has executed nothing while ``a`` ran
+    # to its end: the counter side is still waiting and the finished side
+    # is simply ahead — never a divergence, never a proven equality.
+    assert same["status"] == "ahead"
     assert same["diverged"] is False
+    finished = DebugSession("print(1)\n")
+    finished.continue_()
+    assert a.compare(finished)["status"] == "identical"
+
+
+def test_compare_before_first_step_reports_waiting_not_divergence():
+    # Neither session has executed a single event. The traces differ in
+    # their (already known) future, but future behavior is not a fact yet.
+    base = DebugSession(RECURSIVE)
+    edited = DebugSession(RECURSIVE.replace("n * 10", "n * 20"))
+    result = base.compare(edited)
+    assert result["status"] == "waiting"
+    assert result["diverged"] is False
+    assert result["index"] is None
+    assert result["left"]["event"] is None
+    assert result["right"]["event"] is None
+    assert result["left"]["executedCount"] == 0
+    assert result["right"]["executedCount"] == 0
+    assert result["left"]["terminal"] is False
+
+
+def test_compare_one_side_ahead_is_not_divergence():
+    # Same program; left runs one loop iteration further than right.
+    left = DebugSession(LOOP)
+    right = DebugSession(LOOP)
+    left.set_breakpoints([4])
+    right.set_breakpoints([4])
+    left.continue_()  # i == 0
+    right.continue_()  # i == 0
+    left.continue_()  # i == 1, right stays at i == 0
+    result = left.compare(right)
+    assert result["status"] == "ahead"
+    assert result["diverged"] is False
+    assert result["reason"] == "ahead"
+    # The longer side shows the event the other side has not reached;
+    # the waiting side explicitly has no event there.
+    assert result["left"]["event"] is not None
+    assert result["right"]["event"] is None
+    assert result["right"]["executedCount"] < result["left"]["executedCount"]
+    # Reverse direction: the other side is then reported as ahead.
+    swapped = right.compare(left)
+    assert swapped["status"] == "ahead"
+    assert swapped["left"]["event"] is None
+    assert swapped["right"]["event"] is not None
+
+
+def test_compare_at_chosen_saved_pause_boundaries():
+    left = DebugSession(LOOP)
+    right = DebugSession(LOOP)
+    left.set_breakpoints([4])
+    left.continue_()  # i == 0
+    left.continue_()  # i == 1
+    right.set_breakpoints([4])
+    right.continue_()  # i == 0
+
+    # Pick the older saved pause on the left while the cursor moved on:
+    # the old comparison boundary is preserved exactly as it was.
+    older = [b for b in left.pause_boundaries() if b["line"] == 4][0]["index"]
+    result = left.compare(right, left_boundary=older)
+    assert result["left"]["boundary"] == older
+    assert result["left"]["cursor"] == left.cursor
+    # At that older boundary both sides had executed the same facts.
+    assert result["status"] in {"identical", "waiting"}
+    assert result["diverged"] is False
+
+
+def test_compare_rejects_future_boundary():
+    left = DebugSession(LOOP)
+    right = DebugSession(LOOP)
+    left.step_into()
+    with pytest.raises(ValueError):
+        left.compare(right, left_boundary=left.cursor + 1)
+    with pytest.raises(ValueError):
+        left.compare(right, right_boundary=0)
+    # Comparing before the first step (boundary -1) is legitimate.
+    result = left.compare(right, right_boundary=-1)
+    assert result["status"] == "ahead"
+    assert result["right"]["executedCount"] == 0
+
+
+def test_compare_recursion_return_distinguishes_frames():
+    # Same program, same cursor positions deep in recursion, but the
+    # deeper side must show the extra frame rather than matching on
+    # identical line numbers.
+    shallow = DebugSession(RECURSIVE)
+    deep = DebugSession(RECURSIVE)
+    shallow.set_breakpoints([2])
+    deep.set_breakpoints([2])
+    shallow.continue_()  # fact(3)
+    deep.continue_()  # fact(3)
+    deep.continue_()  # fact(2): same line 2, deeper call
+    result = shallow.compare(deep)
+    assert result["status"] == "ahead"
+    # The first position the shallow side has not reached is shown on the
+    # deep side, with its own call-site/variable snapshot (line 3 inside
+    # fact(3)); line numbers alone are never treated as the same event.
+    ahead_event = result["right"]["event"]
+    assert ahead_event is not None
+    assert ahead_event["line"] == 3
+    assert {f["name"] for f in ahead_event["stack"]} == {"main", "fact"}
+    top_frame = ahead_event["stack"][-1]
+    assert {v["name"]: v["value"]["display"] for v in top_frame["locals"]}[
+        "n"
+    ] == "3"
+
+    # Once the deep side actually pauses inside fact(2), the reported
+    # position carries the extra stack frame rather than matching shallow
+    # merely by sharing line number 2.
+    deep.step_into()  # line 5 (return n * fact(...))
+    deep.step_into()  # line 2 inside fact(2)
+    result = shallow.compare(deep)
+    assert result["status"] == "ahead"
+    later = result["right"]["event"]
+    assert later["line"] == 3 or len(later["stack"]) >= 2
+    deeper_steps = deep.pause_boundaries()
+    deepest_line2 = [b for b in deeper_steps if b["line"] == 2][-1]["index"]
+    pinned = shallow.compare(deep, right_boundary=deepest_line2)
+    # The old/saved boundary is preserved even though deep kept moving
+    # (boundary pinned, cursor shown separately for freshness).
+    assert pinned["right"]["boundary"] == deepest_line2
+    assert pinned["right"]["cursor"] == deep.cursor
+    assert pinned["status"] == "ahead"
+    # The pinned position itself is a real recorded pause with three
+    # frames (main + fact(3) + fact(2)); line 2 alone never implied the
+    # same event as shallow's two-frame line 2.
+    pinned_steps = deep._executed_steps(deepest_line2)
+    assert pinned_steps[-1]["line"] == 2
+    assert len(pinned_steps[-1]["stack"]) == 3
 
 
 def test_branches_survive_save_and_reopen(tmp_path):

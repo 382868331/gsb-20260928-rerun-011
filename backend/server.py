@@ -124,11 +124,35 @@ def fork(session_id: str, body: ForkBody):
     return branch.state()
 
 
+@app.get("/api/sessions/{session_id}/pause-boundaries")
+def pause_boundaries(session_id: str):
+    session = _get(session_id)
+    return {
+        "id": session.id,
+        "cursor": session.cursor,
+        "boundaries": session.pause_boundaries(),
+    }
+
+
 @app.get("/api/sessions/{session_id}/compare/{other_id}")
-def compare(session_id: str, other_id: str):
+def compare(
+    session_id: str,
+    other_id: str,
+    leftBoundary: int | None = None,
+    rightBoundary: int | None = None,
+):
     left = _get(session_id)
     right = _get(other_id)
-    return left.compare(right)
+    try:
+        return left.compare(
+            right,
+            left_boundary=leftBoundary,
+            right_boundary=rightBoundary,
+        )
+    except ValueError as exc:
+        # A boundary beyond the saved cursor would ask the engine to
+        # treat future events as facts; reject before any comparison.
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.put("/api/sessions/{session_id}/breakpoints")
