@@ -11,6 +11,7 @@ from .minilang.lexer import LexError
 from .minilang.parser import ParseError
 
 SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
+COMPARISONS_DIR = Path(__file__).resolve().parent / "comparisons"
 
 
 class SourceError(Exception):
@@ -601,3 +602,76 @@ class SessionStore:
 
     def list_saved(self) -> list[dict]:
         return DebugSession.list_saved(self.directory)
+
+
+class ComparisonStore:
+    """Persists saved branch comparisons as reopenable work results.
+
+    A saved comparison pins the full compare result computed at save
+    time: both sides' program revision hashes, chosen pause boundaries,
+    cursors at save time, and the reported events with their call stacks
+    and variable values. Later stepping, continuing, restarting or even
+    deleting one of the branches never rewrites a saved record; reopening
+    returns the pinned snapshot, with live branch freshness reported
+    separately by the server. Multiple comparisons between the same pair
+    of branches coexist as independent records.
+    """
+
+    def __init__(self, directory: Path = COMPARISONS_DIR):
+        self.directory = directory
+
+    def save(self, result: dict) -> dict:
+        record = {
+            "id": uuid.uuid4().hex[:12],
+            "created_at": time.time(),
+            "left_id": result["left"]["id"],
+            "right_id": result["right"]["id"],
+            "result": result,
+        }
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / f"{record['id']}.json"
+        path.write_text(json.dumps(record, ensure_ascii=False, indent=2))
+        return record
+
+    def _read(self, comparison_id: str) -> dict:
+        path = self.directory / f"{comparison_id}.json"
+        return json.loads(path.read_text())
+
+    def get(self, comparison_id: str) -> dict:
+        return self._read(comparison_id)
+
+    def delete(self, comparison_id: str) -> None:
+        path = self.directory / f"{comparison_id}.json"
+        if path.exists():
+            path.unlink()
+
+    @staticmethod
+    def _summary(record: dict) -> dict:
+        result = record["result"]
+        return {
+            "id": record["id"],
+            "created_at": record.get("created_at"),
+            "leftId": record["left_id"],
+            "rightId": record["right_id"],
+            "leftName": result["left"]["name"],
+            "rightName": result["right"]["name"],
+            "status": result["status"],
+            "reason": result.get("reason"),
+            "index": result.get("index"),
+            "leftBoundary": result["left"]["boundary"],
+            "rightBoundary": result["right"]["boundary"],
+            "leftHash": result["left"]["sourceHash"],
+            "rightHash": result["right"]["sourceHash"],
+        }
+
+    def list(self) -> list[dict]:
+        if not self.directory.exists():
+            return []
+        summaries = []
+        for path in sorted(self.directory.glob("*.json")):
+            try:
+                record = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError, KeyError):
+                continue
+            summaries.append(self._summary(record))
+        return summaries

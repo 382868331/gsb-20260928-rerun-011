@@ -5,6 +5,8 @@ import {
   BpMigration,
   PauseBoundary,
   CompareResult,
+  ComparisonSummary,
+  LiveSide,
   MigrationPreview,
   SessionState,
 } from "./api";
@@ -31,6 +33,18 @@ const REASON_LABEL: Record<string, string> = {
   ahead: "一侧走得更远",
 };
 
+const COMPARE_STATUS_LABEL: Record<string, string> = {
+  identical: "完全一致",
+  waiting: "等待",
+  ahead: "一侧先行",
+  diverged: "首次不同",
+};
+
+// 页面重开后恢复上次会话与比较选择的本地键。
+const LS_SESSION = "minilang.sessionId";
+const LS_TARGET = "minilang.compareTarget";
+const LS_COMPARISON = "minilang.comparisonId";
+
 export default function App() {
   const [source, setSource] = useState(SAMPLE);
   const [session, setSession] = useState<SessionState | null>(null);
@@ -55,6 +69,14 @@ export default function App() {
   const [rightBoundary, setRightBoundary] = useState<number | undefined>(undefined);
   const [leftBoundaries, setLeftBoundaries] = useState<PauseBoundary[]>([]);
   const [rightBoundaries, setRightBoundaries] = useState<PauseBoundary[]>([]);
+  // Saved comparison records: reopenable work results pinned at save time.
+  const [savedComparisons, setSavedComparisons] = useState<ComparisonSummary[]>([]);
+  // Non-empty while a saved record (not a live comparison) is displayed.
+  const [activeComparisonId, setActiveComparisonId] = useState<string>("");
+  const [compareLive, setCompareLive] = useState<{
+    left: LiveSide;
+    right: LiveSide;
+  } | null>(null);
 
   const dirty = useMemo(
     () => session !== null && source !== session.source,
@@ -75,9 +97,58 @@ export default function App() {
     }
   }
 
+  async function refreshComparisons() {
+    try {
+      const res = await api.listComparisons();
+      setSavedComparisons(res.comparisons);
+    } catch {
+      // 比较记录列表刷新失败不影响调试主流程。
+    }
+  }
+
   useEffect(() => {
+    // 页面重开：恢复上次的调试会话与比较选择。
     refreshBranches();
+    refreshComparisons();
+    (async () => {
+      let restoredId: string | null = null;
+      const sid = localStorage.getItem(LS_SESSION);
+      if (sid) {
+        try {
+          const state = await api.get(sid);
+          setSession(state);
+          setSource(state.source);
+          restoredId = state.id;
+        } catch {
+          localStorage.removeItem(LS_SESSION);
+        }
+      }
+      const cid = localStorage.getItem(LS_COMPARISON);
+      if (cid) {
+        try {
+          await openComparison(cid, restoredId ?? undefined);
+          return;
+        } catch {
+          localStorage.removeItem(LS_COMPARISON);
+        }
+      }
+      const target = localStorage.getItem(LS_TARGET);
+      if (target) setCompareTarget(target);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (session) localStorage.setItem(LS_SESSION, session.id);
+  }, [session?.id]);
+
+  useEffect(() => {
+    localStorage.setItem(LS_TARGET, compareTarget);
+  }, [compareTarget]);
+
+  useEffect(() => {
+    localStorage.setItem(LS_COMPARISON, activeComparisonId);
+  }, [activeComparisonId]);
 
   async function run(action: () => Promise<SessionState>) {
     setError("");
@@ -89,8 +160,20 @@ export default function App() {
       // continuing one branch must not rewrite the old result; the
       // comparison panel shows separately when either side moved on.
       refreshBranches();
+      if (activeComparisonId) {
+        refreshLive(activeComparisonId);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function refreshLive(cid: string) {
+    try {
+      const saved = await api.getComparison(cid);
+      setCompareLive(saved.live);
+    } catch {
+      // 记录被删除等情况由列表刷新处理。
     }
   }
 
@@ -208,7 +291,12 @@ export default function App() {
       const parent = await api.get(parentId);
       setSession(parent);
       setSource(parent.source);
-      setCompareResult(null);
+      // 已保存的比较记录不随分支放弃而消失；只刷新其新鲜度提示。
+      if (activeComparisonId) {
+        refreshLive(activeComparisonId);
+      } else {
+        setCompareResult(null);
+      }
       setNotice("已放弃实验分支，回到原暂停现场。");
       refreshBranches();
     } catch (e) {
@@ -234,6 +322,8 @@ export default function App() {
     if (!session || !compareTarget) return;
     setError("");
     try {
+      setActiveComparisonId("");
+      setCompareLive(null);
       const [leftB, rightB] = await Promise.all([
         api.pauseBoundaries(session.id),
         api.pauseBoundaries(compareTarget),
@@ -249,6 +339,66 @@ export default function App() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
+  }
+
+  async function saveCompare() {
+    if (!session || !compareTarget) return;
+    setError("");
+    try {
+      const record = await api.saveCompare(session.id, compareTarget, {
+        leftBoundary,
+        rightBoundary,
+      });
+      // 保存后立即按记录展示：结果钉在此刻，后续执行不改写它。
+      const saved = await api.getComparison(record.id);
+      setCompareResult(saved.record.result);
+      setCompareLive(saved.live);
+      setActiveComparisonId(record.id);
+      setNotice("比较已保存为可重开的工作结果，后续单步/继续/切换分支都不会改写它。");
+      refreshComparisons();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function openComparison(cid: string, currentSessionId?: string) {
+    setError("");
+    try {
+      const saved = await api.getComparison(cid);
+      const result = saved.record.result;
+      setCompareResult(result);
+      setCompareLive(saved.live);
+      setActiveComparisonId(cid);
+      const sid = currentSessionId ?? session?.id;
+      const other =
+        result.left.id === sid ? result.right.id : result.left.id;
+      setCompareTarget(other);
+      setLeftBoundary(result.left.boundary);
+      setRightBoundary(result.right.boundary);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function removeComparison(cid: string) {
+    setError("");
+    try {
+      await api.deleteComparison(cid);
+      if (activeComparisonId === cid) {
+        setActiveComparisonId("");
+        setCompareResult(null);
+        setCompareLive(null);
+      }
+      refreshComparisons();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function backToLiveCompare() {
+    setActiveComparisonId("");
+    setCompareLive(null);
+    runCompare();
   }
 
   async function chooseCompareTarget(id: string) {
@@ -485,6 +635,13 @@ export default function App() {
               <button onClick={runCompare} disabled={!session || !compareTarget}>
                 比较
               </button>
+              <button
+                onClick={saveCompare}
+                disabled={!session || !compareTarget}
+                title="把当前比较保存为可重开的工作结果"
+              >
+                保存比较
+              </button>
             </div>
             {compareTarget && (
               <div className="compare-boundaries">
@@ -492,15 +649,19 @@ export default function App() {
                   本侧暂停边界
                   <select
                     value={leftBoundary === undefined ? "" : String(leftBoundary)}
-                    onChange={(e) =>
+                    disabled={activeComparisonId !== ""}
+                    onChange={(e) => {
+                      setActiveComparisonId("");
+                      setCompareLive(null);
                       setLeftBoundary(
                         e.target.value === ""
                           ? undefined
                           : Number(e.target.value)
-                      )
-                    }
+                      );
+                    }}
                   >
                     <option value="">当前暂停位置</option>
+                    <option value="-1">会话开始（零事件）</option>
                     {leftBoundaries.map((b) => (
                       <option key={b.index} value={b.index}>
                         第 {b.line} 行（事件 {b.index}）
@@ -512,15 +673,19 @@ export default function App() {
                   对侧暂停边界
                   <select
                     value={rightBoundary === undefined ? "" : String(rightBoundary)}
-                    onChange={(e) =>
+                    disabled={activeComparisonId !== ""}
+                    onChange={(e) => {
+                      setActiveComparisonId("");
+                      setCompareLive(null);
                       setRightBoundary(
                         e.target.value === ""
                           ? undefined
                           : Number(e.target.value)
-                      )
-                    }
+                      );
+                    }}
                   >
                     <option value="">当前暂停位置</option>
+                    <option value="-1">会话开始（零事件）</option>
                     {rightBoundaries.map((b) => (
                       <option key={b.index} value={b.index}>
                         第 {b.line} 行（事件 {b.index}）
@@ -530,8 +695,75 @@ export default function App() {
                 </label>
               </div>
             )}
+            {savedComparisons.length > 0 && (
+              <div className="saved-comparisons">
+                <h3>已保存的比较</h3>
+                {savedComparisons.map((c) => (
+                  <div
+                    key={c.id}
+                    className={
+                      "branch" + (c.id === activeComparisonId ? " selected" : "")
+                    }
+                    onClick={() => openComparison(c.id)}
+                  >
+                    <span className="fname">
+                      {c.leftName} ↔ {c.rightName}
+                    </span>
+                    <span className="fline">
+                      {COMPARE_STATUS_LABEL[c.status] ?? c.status}
+                      {" · 边界 "}
+                      {c.leftBoundary}/{c.rightBoundary}
+                      {" · 修订 "}
+                      {c.leftHash.slice(0, 6)}/{c.rightHash.slice(0, 6)}
+                    </span>
+                    <button
+                      className="link-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeComparison(c.id);
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             {compareResult && (
               <div className="compare-result">
+                {activeComparisonId && (
+                  <div className="saved-note">
+                    已保存的比较记录：双方修订、边界与调用现场已钉住，
+                    后续单步/继续/切换分支都不会改写它。
+                    <button className="link-btn" onClick={backToLiveCompare}>
+                      返回实时比较
+                    </button>
+                  </div>
+                )}
+                {compareLive &&
+                  (["left", "right"] as const).map((side) => {
+                    const liveSide = compareLive[side];
+                    const pinned = compareResult[side];
+                    if (liveSide.missing) {
+                      return (
+                        <div key={side} className="stale-note">
+                          {pinned.name} 已被放弃，记录保留其当时的执行事实。
+                        </div>
+                      );
+                    }
+                    if (
+                      liveSide.cursor !== undefined &&
+                      liveSide.cursor !== pinned.cursor
+                    ) {
+                      return (
+                        <div key={side} className="stale-note">
+                          {pinned.name} 现已走到事件 {liveSide.cursor}
+                          ，本记录仍钉在事件 {pinned.cursor}。
+                        </div>
+                      );
+                    }
+                    return null;
+                  })}
                 {compareResult.status === "identical" && (
                   <div className="empty">
                     两侧都已运行到结束，已执行部分的执行事实完全一致。

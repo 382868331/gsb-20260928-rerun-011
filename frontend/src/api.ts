@@ -90,6 +90,41 @@ export interface CompareResult {
   right: CompareSide;
 }
 
+export interface ComparisonSummary {
+  id: string;
+  created_at: number | null;
+  leftId: string;
+  rightId: string;
+  leftName: string;
+  rightName: string;
+  status: string;
+  reason: string | null;
+  index: number | null;
+  leftBoundary: number;
+  rightBoundary: number;
+  leftHash: string;
+  rightHash: string;
+}
+
+export interface LiveSide {
+  id: string;
+  missing: boolean;
+  name?: string;
+  cursor?: number;
+  status?: string;
+}
+
+export interface SavedComparison {
+  record: {
+    id: string;
+    created_at: number | null;
+    left_id: string;
+    right_id: string;
+    result: CompareResult;
+  };
+  live: { left: LiveSide; right: LiveSide };
+}
+
 export interface MigrationCandidate {
   line: number;
   text: string;
@@ -165,6 +200,28 @@ export const api = {
       `/api/sessions/${id}/compare/${otherId}${query ? `?${query}` : ""}`
     );
   },
+  saveCompare: (
+    id: string,
+    otherId: string,
+    boundaries?: { leftBoundary?: number; rightBoundary?: number }
+  ) => {
+    const params = new URLSearchParams();
+    if (boundaries?.leftBoundary !== undefined)
+      params.set("leftBoundary", String(boundaries.leftBoundary));
+    if (boundaries?.rightBoundary !== undefined)
+      params.set("rightBoundary", String(boundaries.rightBoundary));
+    const query = params.toString();
+    return request<SavedComparison["record"]>(
+      `/api/sessions/${id}/compare/${otherId}/save${query ? `?${query}` : ""}`,
+      { method: "POST" }
+    );
+  },
+  listComparisons: () =>
+    request<{ comparisons: ComparisonSummary[] }>("/api/comparisons"),
+  getComparison: (id: string) =>
+    request<SavedComparison>(`/api/comparisons/${id}`),
+  deleteComparison: (id: string) =>
+    request<{ ok: boolean }>(`/api/comparisons/${id}`, { method: "DELETE" }),
   step: (id: string, mode: "into" | "over") =>
     request<SessionState>(`/api/sessions/${id}/step`, {
       method: "POST",

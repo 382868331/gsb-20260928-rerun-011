@@ -119,6 +119,17 @@ aside {
 }
 .stale-note { color: #e0b56a; }
 .waiting-note { color: #7fa8d8; font-style: italic; }
+.saved-note {
+  display: flex; align-items: center; gap: 8px; justify-content: space-between;
+  background: #14342a; border: 1px solid #2a5a46; border-radius: 6px;
+  padding: 6px 8px; font-size: 12px; color: #9fe8c8;
+}
+.saved-comparisons { margin: 8px 0; }
+.saved-comparisons h3 { margin: 4px 0; font-size: 13px; }
+.link-btn {
+  background: none; border: none; color: #7fa8d8; cursor: pointer;
+  font-size: 12px; padding: 0 4px; text-decoration: underline;
+}
 .frame-chip {
   display: inline-block; margin-left: 4px; padding: 0 5px;
   background: #2a2c34; border-radius: 4px; color: #9ecbff;

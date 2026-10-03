@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .debugger import SessionStore, SourceError
+from .debugger import ComparisonStore, SessionStore, SourceError
 
 app = FastAPI(title="MiniLang 可视化调试器")
 app.add_middleware(
@@ -19,6 +19,7 @@ app.add_middleware(
 )
 
 store = SessionStore()
+comparison_store = ComparisonStore()
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
@@ -153,6 +154,71 @@ def compare(
         # A boundary beyond the saved cursor would ask the engine to
         # treat future events as facts; reject before any comparison.
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/sessions/{session_id}/compare/{other_id}/save")
+def save_compare(
+    session_id: str,
+    other_id: str,
+    leftBoundary: int | None = None,
+    rightBoundary: int | None = None,
+):
+    left = _get(session_id)
+    right = _get(other_id)
+    try:
+        result = left.compare(
+            right,
+            left_boundary=leftBoundary,
+            right_boundary=rightBoundary,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # The record pins revisions, boundaries, cursors and the full event
+    # facts as they are now; nothing later rewrites it.
+    return comparison_store.save(result)
+
+
+@app.get("/api/comparisons")
+def list_comparisons():
+    return {"comparisons": comparison_store.list()}
+
+
+def _get_comparison(comparison_id: str):
+    try:
+        return comparison_store.get(comparison_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="比较记录不存在")
+
+
+@app.get("/api/comparisons/{comparison_id}")
+def get_comparison(comparison_id: str):
+    record = _get_comparison(comparison_id)
+    # Freshness is reported alongside the pinned result, never merged
+    # into it: a branch that moved on (or was abandoned) does not
+    # rewrite the saved comparison.
+    live = {}
+    for side in ("left", "right"):
+        sid = record["result"][side]["id"]
+        try:
+            session = store.get(sid)
+        except FileNotFoundError:
+            live[side] = {"id": sid, "missing": True}
+        else:
+            live[side] = {
+                "id": sid,
+                "missing": False,
+                "name": session.name,
+                "cursor": session.cursor,
+                "status": session.status(),
+            }
+    return {"record": record, "live": live}
+
+
+@app.delete("/api/comparisons/{comparison_id}")
+def delete_comparison(comparison_id: str):
+    _get_comparison(comparison_id)
+    comparison_store.delete(comparison_id)
+    return {"ok": True}
 
 
 @app.put("/api/sessions/{session_id}/breakpoints")

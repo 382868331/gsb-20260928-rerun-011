@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from backend.debugger import DebugSession, SessionStore, SourceError, source_hash
+from backend.debugger import (
+    ComparisonStore,
+    DebugSession,
+    SessionStore,
+    SourceError,
+    source_hash,
+)
 
 RECURSIVE = """fun fact(n)
     let local = n * 10
@@ -551,3 +557,106 @@ def test_branches_survive_save_and_reopen(tmp_path):
     listed = {item["id"]: item for item in fresh.list_saved()}
     assert listed[branch.id]["parentId"] == parent.id
     assert listed[branch.id]["name"] == "乘20"
+
+
+def _loop_pair(store):
+    left = store.create(LOOP)
+    right = store.register(left.fork(name="实验"))
+    return left, right
+
+
+def test_saved_comparison_is_pinned_and_reopenable(tmp_path):
+    store = SessionStore(directory=tmp_path / "sessions")
+    comparisons = ComparisonStore(directory=tmp_path / "comparisons")
+    left, right = _loop_pair(store)
+    left.set_breakpoints([4])
+    left.continue_()  # i == 0
+    right.set_breakpoints([4])
+    right.continue_()
+    right.continue_()  # i == 1: one side ahead
+
+    result = left.compare(right)
+    assert result["status"] == "ahead"
+    record = comparisons.save(result)
+
+    # Both branches keep moving afterwards; the saved record must not change.
+    left.continue_()
+    left.continue_()
+    right.continue_()
+    store.touch(left)
+    store.touch(right)
+
+    fresh = ComparisonStore(directory=tmp_path / "comparisons")
+    reopened = fresh.get(record["id"])
+    assert reopened["result"] == result
+    assert reopened["result"]["left"]["cursor"] != left.cursor
+    assert reopened["result"]["left"]["boundary"] == result["left"]["boundary"]
+    # The pinned ahead event keeps its call site and variable values.
+    event = reopened["result"]["right"]["event"]
+    assert event is not None
+    assert event["kind"] == "line"
+    top = {v["name"]: v["value"]["display"] for v in event["stack"][-1]["locals"]}
+    assert top["i"] == "0"
+
+    summaries = fresh.list()
+    assert [s["id"] for s in summaries] == [record["id"]]
+    assert summaries[0]["status"] == "ahead"
+    assert summaries[0]["leftId"] == left.id
+    assert summaries[0]["rightId"] == right.id
+
+
+def test_multiple_comparisons_same_pair_coexist(tmp_path):
+    store = SessionStore(directory=tmp_path / "sessions")
+    comparisons = ComparisonStore(directory=tmp_path / "comparisons")
+    left, right = _loop_pair(store)
+
+    zero = comparisons.save(left.compare(right))
+    left.step_into()
+    store.touch(left)
+    one_sided = comparisons.save(left.compare(right))
+    right.step_into()
+    right.step_into()
+    left.step_into()
+    both = comparisons.save(left.compare(right))
+
+    fresh = ComparisonStore(directory=tmp_path / "comparisons")
+    ids = [s["id"] for s in fresh.list()]
+    assert set(ids) == {zero["id"], one_sided["id"], both["id"]}
+    # Zero-event comparison: empty executed sets are waiting, never
+    # reported as whole-program equality.
+    assert fresh.get(zero["id"])["result"]["status"] == "waiting"
+    assert fresh.get(zero["id"])["result"]["left"]["executedCount"] == 0
+    # One side moved first.
+    assert fresh.get(one_sided["id"])["result"]["status"] == "ahead"
+    # Both reached pauses; still waiting until both terminate.
+    both_result = fresh.get(both["id"])["result"]
+    assert both_result["status"] in {"waiting", "identical", "ahead"}
+    # Records are independent: deleting one keeps the others.
+    fresh.delete(one_sided["id"])
+    remaining = {s["id"] for s in fresh.list()}
+    assert remaining == {zero["id"], both["id"]}
+
+
+def test_saved_comparison_survives_branch_abandon(tmp_path):
+    store = SessionStore(directory=tmp_path / "sessions")
+    comparisons = ComparisonStore(directory=tmp_path / "comparisons")
+    left, right = _loop_pair(store)
+    left.step_into()
+    right.step_into()
+    # A deeper descendant keeps its own explainable origin.
+    grandchild = store.register(right.fork(name="后代"))
+    record = comparisons.save(left.compare(right))
+
+    # Abandon the intermediate experiment branch.
+    store.delete(right.id)
+
+    fresh = ComparisonStore(directory=tmp_path / "comparisons")
+    reopened = fresh.get(record["id"])
+    # The saved comparison keeps the abandoned branch's pinned facts.
+    assert reopened["result"]["right"]["id"] == right.id
+    assert reopened["result"]["status"] == "waiting"
+    # The descendant branch still loads with its own source and parent link.
+    fresh_store = SessionStore(directory=tmp_path / "sessions")
+    loaded = fresh_store.get(grandchild.id)
+    assert loaded.parent_id == right.id
+    assert loaded.source == LOOP
