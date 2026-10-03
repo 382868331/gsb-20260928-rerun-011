@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from backend.debugger import DebugSession, SessionStore, SourceError, source_hash
+from backend.debugger import (
+    ComparisonStore,
+    DebugSession,
+    SessionStore,
+    SourceError,
+    source_hash,
+)
 
 RECURSIVE = """fun fact(n)
     let local = n * 10
@@ -551,3 +557,122 @@ def test_branches_survive_save_and_reopen(tmp_path):
     listed = {item["id"]: item for item in fresh.list_saved()}
     assert listed[branch.id]["parentId"] == parent.id
     assert listed[branch.id]["name"] == "乘20"
+
+def test_saved_comparison_survives_reopen_and_later_steps(tmp_path):
+    store = SessionStore(directory=tmp_path / "sessions")
+    comparisons = ComparisonStore(directory=tmp_path / "comparisons")
+    base = store.create(RECURSIVE)
+    edited = store.register(base.fork(source=RECURSIVE.replace("n * 10", "n * 20")))
+    for session in (base, edited):
+        session.set_breakpoints([3])  # if n <= 1: local 已求值，两侧不同
+        session.continue_()
+        store.touch(session)
+
+    record = comparisons.save(base, edited)
+    assert record["result"]["status"] == "diverged"
+    saved_boundary = record["left_boundary"]
+    saved_event = record["result"]["left"]["event"]
+    assert saved_event is not None
+
+    # Later stepping/continuing either branch must not rewrite the record.
+    base.continue_()
+    edited.step_into()
+    store.touch(base)
+    store.touch(edited)
+
+    # Reopen everything from disk (simulates closing the page).
+    fresh_store = SessionStore(directory=tmp_path / "sessions")
+    fresh_comparisons = ComparisonStore(directory=tmp_path / "comparisons")
+    restored = fresh_comparisons.get(record["id"])
+    assert restored == record
+    assert restored["left_boundary"] == saved_boundary
+    assert restored["result"]["left"]["event"] == saved_event
+    assert restored["result"]["left"]["cursor"] != base.cursor or \
+        restored["result"]["right"]["cursor"] != edited.cursor
+    # The pinned call-site / variable evidence is intact.
+    left_frames = restored["result"]["left"]["event"]["stack"]
+    right_frames = restored["result"]["right"]["event"]["stack"]
+    assert left_frames and right_frames
+    left_local = {v["name"]: v["value"]["display"] for v in left_frames[-1]["locals"]}
+    right_local = {v["name"]: v["value"]["display"] for v in right_frames[-1]["locals"]}
+    assert left_local["local"] == "30"
+    assert right_local["local"] == "60"
+    # Live branches still resume independently.
+    assert fresh_store.get(base.id).cursor == base.cursor
+
+
+def test_saved_comparison_zero_events_stays_waiting(tmp_path):
+    comparisons = ComparisonStore(directory=tmp_path)
+    left = DebugSession(LOOP)
+    right = DebugSession(LOOP.replace("i < 5", "i < 6"))
+    # Neither side has executed any event: empty sets are not equality.
+    record = comparisons.save(left, right)
+    assert record["result"]["status"] == "waiting"
+    assert record["result"]["diverged"] is False
+    assert record["left_boundary"] == -1
+    assert record["right_boundary"] == -1
+    restored = ComparisonStore(directory=tmp_path).get(record["id"])
+    assert restored["result"]["status"] == "waiting"
+
+
+def test_multiple_saved_comparisons_for_same_pair(tmp_path):
+    comparisons = ComparisonStore(directory=tmp_path)
+    left = DebugSession(LOOP)
+    right = DebugSession(LOOP)
+    # 1) zero-event comparison
+    zero = comparisons.save(left, right, name="零事件")
+    # 2) one side ahead
+    left.step_into()
+    left.step_into()
+    ahead = comparisons.save(left, right, name="单侧先行")
+    # 3) both sides reached the same pause
+    right.step_into()
+    right.step_into()
+    both = comparisons.save(left, right, name="双方到达")
+    assert zero["result"]["status"] == "waiting"
+    assert ahead["result"]["status"] == "ahead"
+    assert ahead["result"]["right"]["event"] is None
+    # Same program, both paused mid-run: equal so far but not terminal.
+    assert both["result"]["status"] == "waiting"
+    assert both["result"]["left"]["stepCount"] == 2
+    assert both["result"]["right"]["stepCount"] == 2
+
+    listed = ComparisonStore(directory=tmp_path).list()
+    assert [item["id"] for item in listed] == [zero["id"], ahead["id"], both["id"]]
+    assert [item["name"] for item in listed] == ["零事件", "单侧先行", "双方到达"]
+    # Each record reopens exactly as saved, regardless of later steps.
+    left.continue_()
+    right.continue_()
+    fresh = ComparisonStore(directory=tmp_path)
+    assert fresh.get(ahead["id"])["result"]["status"] == "ahead"
+    assert fresh.get(both["id"])["left_boundary"] == both["left_boundary"]
+
+
+def test_deleting_middle_branch_keeps_comparisons_and_descendants(tmp_path):
+    store = SessionStore(directory=tmp_path / "sessions")
+    comparisons = ComparisonStore(directory=tmp_path / "comparisons")
+    root = store.create(RECURSIVE)
+    root.step_into()
+    middle = store.register(root.fork(name="中间实验"))
+    middle.step_into()
+    child = store.register(middle.fork(
+        source=RECURSIVE.replace("n * 10", "n * 20"), name="后代分支"
+    ))
+    child.step_into()
+    record = comparisons.save(middle, child)
+    store.touch(child)
+
+    # Abandon the intermediate experiment.
+    store.delete(middle.id)
+    fresh_store = SessionStore(directory=tmp_path / "sessions")
+    fresh_comparisons = ComparisonStore(directory=tmp_path / "comparisons")
+    # The saved comparison is a self-contained snapshot and survives.
+    restored = fresh_comparisons.get(record["id"])
+    assert restored["result"] == record["result"]
+    # The descendant still reopens with its explainable provenance.
+    reopened_child = fresh_store.get(child.id)
+    assert reopened_child.parent_id == middle.id
+    assert reopened_child.fork_cursor is not None
+    assert reopened_child.cursor == child.cursor
+    listed = {item["id"]: item for item in fresh_store.list_saved()}
+    assert listed[child.id]["parentId"] == middle.id

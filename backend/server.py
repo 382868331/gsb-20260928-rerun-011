@@ -47,6 +47,12 @@ class ForkBody(BaseModel):
     bpMigrations: list[dict] = []
 
 
+class CompareSaveBody(BaseModel):
+    leftBoundary: int | None = None
+    rightBoundary: int | None = None
+    name: str | None = None
+
+
 def _get(session_id: str):
     try:
         return store.get(session_id)
@@ -153,6 +159,41 @@ def compare(
         # A boundary beyond the saved cursor would ask the engine to
         # treat future events as facts; reject before any comparison.
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/sessions/{session_id}/compare/{other_id}/save")
+def save_comparison(session_id: str, other_id: str, body: CompareSaveBody):
+    left = _get(session_id)
+    right = _get(other_id)
+    try:
+        return store.comparisons.save(
+            left,
+            right,
+            left_boundary=body.leftBoundary,
+            right_boundary=body.rightBoundary,
+            name=body.name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/comparisons")
+def list_comparisons():
+    return {"comparisons": store.comparisons.list()}
+
+
+@app.get("/api/comparisons/{comparison_id}")
+def get_comparison(comparison_id: str):
+    try:
+        return store.comparisons.get(comparison_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="比较记录不存在")
+
+
+@app.delete("/api/comparisons/{comparison_id}")
+def delete_comparison(comparison_id: str):
+    store.comparisons.delete(comparison_id)
+    return {"ok": True}
 
 
 @app.put("/api/sessions/{session_id}/breakpoints")

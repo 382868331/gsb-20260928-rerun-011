@@ -6,6 +6,8 @@ import {
   PauseBoundary,
   CompareResult,
   MigrationPreview,
+  SavedComparison,
+  SavedComparisonSummary,
   SessionState,
 } from "./api";
 
@@ -55,6 +57,10 @@ export default function App() {
   const [rightBoundary, setRightBoundary] = useState<number | undefined>(undefined);
   const [leftBoundaries, setLeftBoundaries] = useState<PauseBoundary[]>([]);
   const [rightBoundaries, setRightBoundaries] = useState<PauseBoundary[]>([]);
+  // Saved comparisons are reopenable work results: pinned snapshots that
+  // later stepping/continuing/switching never rewrites.
+  const [savedComparisons, setSavedComparisons] = useState<SavedComparisonSummary[]>([]);
+  const [savedView, setSavedView] = useState<SavedComparison | null>(null);
 
   const dirty = useMemo(
     () => session !== null && source !== session.source,
@@ -78,6 +84,49 @@ export default function App() {
   useEffect(() => {
     refreshBranches();
   }, []);
+
+  async function refreshComparisons() {
+    try {
+      const res = await api.listComparisons();
+      setSavedComparisons(res.comparisons);
+    } catch {
+      // 比较记录列表刷新失败不影响调试主流程。
+    }
+  }
+
+  // 页面重开时恢复原会话与上次查看的比较选择。
+  useEffect(() => {
+    refreshComparisons();
+    const lastSession = localStorage.getItem("ml.sessionId");
+    if (lastSession) {
+      api.get(lastSession)
+        .then((state) => {
+          setSession(state);
+          setSource(state.source);
+        })
+        .catch(() => localStorage.removeItem("ml.sessionId"));
+    }
+    const lastTarget = localStorage.getItem("ml.compareTarget");
+    if (lastTarget) setCompareTarget(lastTarget);
+    const lastComparison = localStorage.getItem("ml.comparisonId");
+    if (lastComparison) {
+      api.getComparison(lastComparison)
+        .then((record) => setSavedView(record))
+        .catch(() => localStorage.removeItem("ml.comparisonId"));
+    }
+  }, []);
+
+  // 记住当前会话与比较选择，供关闭页面后恢复。
+  useEffect(() => {
+    if (session) localStorage.setItem("ml.sessionId", session.id);
+  }, [session?.id]);
+  useEffect(() => {
+    if (compareTarget) localStorage.setItem("ml.compareTarget", compareTarget);
+  }, [compareTarget]);
+  useEffect(() => {
+    if (savedView) localStorage.setItem("ml.comparisonId", savedView.id);
+    else localStorage.removeItem("ml.comparisonId");
+  }, [savedView?.id]);
 
   async function run(action: () => Promise<SessionState>) {
     setError("");
@@ -230,7 +279,7 @@ export default function App() {
     );
   }
 
-  async function runCompare() {
+ async function runCompare() {
     if (!session || !compareTarget) return;
     setError("");
     try {
@@ -246,6 +295,45 @@ export default function App() {
           rightBoundary,
         })
       );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function saveCurrentCompare() {
+    if (!session || !compareTarget || !compareResult) return;
+    setError("");
+    try {
+      const record = await api.saveCompare(session.id, compareTarget, {
+        leftBoundary,
+        rightBoundary,
+      });
+      setSavedView(record);
+      setNotice(
+        "比较已保存为可重开的工作结果：双方修订、暂停边界与调用现场已固定，" +
+        "后续单步/继续/切换分支都不会改写它。"
+      );
+      refreshComparisons();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function openSavedComparison(id: string) {
+    setError("");
+    try {
+      setSavedView(await api.getComparison(id));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function deleteSavedComparison(id: string) {
+    setError("");
+    try {
+      await api.deleteComparison(id);
+      if (savedView?.id === id) setSavedView(null);
+      refreshComparisons();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -270,6 +358,117 @@ export default function App() {
   }
 
   const lines = source.split("\n");
+  const COMPARE_STATUS_LABEL: Record<string, string> = {
+    identical: "完全一致",
+    waiting: "等待中",
+    ahead: "单侧先行",
+    diverged: "已有分歧",
+  };
+
+  // 渲染一次比较结果（实时或已保存的快照共用）。
+  function renderCompareResult(result: CompareResult, saved: boolean) {
+    return (
+      <div className="compare-result">
+        <div className="fline">
+          共同执行且一致：前 {result.common} 个暂停步
+          {result.status === "ahead" &&
+            result.index !== null &&
+            `；第 ${result.index} 步起仅由一侧到达`}
+          {result.status === "diverged" &&
+            result.index !== null &&
+            `；第 ${result.index} 步首次真正不同`}
+          {saved && "（已保存快照，数值与边界固定）"}
+        </div>
+        {result.status === "identical" && (
+          <div className="empty">
+            两侧都已运行到结束，已执行部分的执行事实完全一致。
+          </div>
+        )}
+        {result.status === "waiting" && (
+          <div className="empty">
+            已执行的公共部分一致；至少一侧尚未运行到所选位置，
+            后续部分标记为等待——不把尚未发生的未来行为当作事实。
+          </div>
+        )}
+        {result.status === "ahead" && (
+          <div>
+            公共已执行部分一致；一侧走得更远（多执行了循环/递归步），
+            另一侧该位置尚未到达，并非输出或变量分歧。
+          </div>
+        )}
+        {result.status === "diverged" && (
+          <>
+            <div>
+              首次不同：第 {result.index} 个暂停步（
+              {REASON_LABEL[result.reason ?? ""]}）
+            </div>
+            {!result.sameRevision && (
+              <div className="revision-note">
+                两侧记录来自不同程序修订（
+                {result.left.sourceHash.slice(0, 6)} vs{" "}
+                {result.right.sourceHash.slice(0, 6)}
+                ），相同行号不代表同一步。
+              </div>
+            )}
+            {([result.left, result.right] as const).map((side, i) => (
+              <div key={i} className="compare-side">
+                <div className="fname">
+                  {side.name} · 修订 {side.sourceHash.slice(0, 6)}
+                </div>
+                <div className="fline">
+                  比较边界：事件 {side.boundary}
+                  {side.boundary !== side.cursor && (
+                    <span className="stale-note">
+                      （该分支现已走到事件 {side.cursor}，本比较仍钉在旧边界）
+                    </span>
+                  )}
+                  {" · "}
+                  已执行 {side.executedCount} 个事件 / {side.stepCount} 个暂停步
+                  {side.terminal ? " · 已到终态" : " · 仍在等待"}
+                </div>
+                {side.event ? (
+                  <>
+                    <div className="fline">
+                      事件 {side.event.kind}
+                      {side.event.line != null &&
+                        ` · 第 ${side.event.line} 行`}
+                      {side.event.message && ` · ${side.event.message}`}
+                    </div>
+                    {side.event.stack.length > 0 && (
+                      <div className="fline">
+                        调用链：
+                        {side.event.stack.map((f, fi) => (
+                          <span key={fi} className="frame-chip">
+                            {f.name}@第{f.line}行
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {side.event.stack.length > 0 && (
+                      <div className="fline">
+                        当前帧变量：
+                        {side.event.stack[side.event.stack.length - 1].locals
+                          .map((v) => `${v.name}=${v.value.display}`)
+                          .join("，") || "（无局部变量）"}
+                      </div>
+                    )}
+                    {side.event.output && (
+                      <pre className="output">{side.event.output}</pre>
+                    )}
+                  </>
+                ) : (
+                  <div className="fline waiting-note">
+                    （等待：该侧尚未执行到对应位置，未来事件不计入比较）
+                  </div>
+                )}
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+    );
+  }
+
   const stack = session?.stack ?? [];
   const frameIndex =
     selectedFrame >= 0 && selectedFrame < stack.length
@@ -531,101 +730,55 @@ export default function App() {
               </div>
             )}
             {compareResult && (
-              <div className="compare-result">
-                {compareResult.status === "identical" && (
-                  <div className="empty">
-                    两侧都已运行到结束，已执行部分的执行事实完全一致。
+              <>
+                <div className="compare-actions">
+                  <button onClick={saveCurrentCompare}>
+                    保存为可重开的比较
+                  </button>
+                </div>
+                {renderCompareResult(compareResult, false)}
+              </>
+            )}
+            {savedView && (
+              <div className="saved-view">
+                <div className="fname">
+                  已保存的比较：{savedView.name}
+                  <button onClick={() => setSavedView(null)}>关闭</button>
+                </div>
+                <div className="fline">
+                  保存于{" "}
+                  {new Date(savedView.created_at * 1000).toLocaleString()}
+                  ，双方修订、暂停边界与调用现场已固定。
+                </div>
+                {renderCompareResult(savedView.result, true)}
+              </div>
+            )}
+            {savedComparisons.length > 0 && (
+              <div className="saved-list">
+                <h3>已保存的比较</h3>
+                {savedComparisons.map((c) => (
+                  <div
+                    key={c.id}
+                    className={`branch ${savedView?.id === c.id ? "selected" : ""}`}
+                    onClick={() => openSavedComparison(c.id)}
+                  >
+                    <span className="fname">{c.name || "未命名比较"}</span>
+                    <span className="fline">
+                      {c.leftName}（{c.leftHash?.slice(0, 6)}） vs{" "}
+                      {c.rightName}（{c.rightHash?.slice(0, 6)}） ·{" "}
+                      {COMPARE_STATUS_LABEL[c.status ?? ""] ?? c.status} · 边界{" "}
+                      {c.leftBoundary}/{c.rightBoundary}
+                    </span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteSavedComparison(c.id);
+                      }}
+                    >
+                      删除
+                    </button>
                   </div>
-                )}
-                {compareResult.status === "waiting" && (
-                  <div className="empty">
-                    已执行的公共部分一致；至少一侧尚未运行到所选位置，
-                    后续部分标记为等待——不把尚未发生的未来行为当作事实。
-                  </div>
-                )}
-                {compareResult.status === "ahead" && (
-                  <div>
-                    公共已执行部分一致；一侧走得更远（多执行了循环/递归步），
-                    另一侧该位置尚未到达，并非输出或变量分歧。
-                  </div>
-                )}
-                {compareResult.status === "diverged" && (
-                  <>
-                    <div>
-                      首次不同：第 {compareResult.index} 个暂停步（
-                      {REASON_LABEL[compareResult.reason ?? ""]}）
-                    </div>
-                    {!compareResult.sameRevision && (
-                      <div className="revision-note">
-                        两侧记录来自不同程序修订（
-                        {compareResult.left.sourceHash.slice(0, 6)} vs{" "}
-                        {compareResult.right.sourceHash.slice(0, 6)}
-                        ），相同行号不代表同一步。
-                      </div>
-                    )}
-                    {([compareResult.left, compareResult.right] as const).map(
-                      (side, i) => (
-                        <div key={i} className="compare-side">
-                          <div className="fname">
-                            {side.name} · 修订 {side.sourceHash.slice(0, 6)}
-                          </div>
-                          <div className="fline">
-                            比较边界：事件 {side.boundary}
-                            {side.boundary !== side.cursor && (
-                              <span className="stale-note">
-                                （该分支现已走到事件 {side.cursor}，本比较仍钉在旧边界）
-                              </span>
-                            )}
-                            {' · '}
-                            已执行 {side.executedCount} 个事件 / {side.stepCount} 个暂停步
-                            {side.terminal ? " · 已到终态" : " · 仍在等待"}
-                          </div>
-                          {side.event ? (
-                            <>
-                              <div className="fline">
-                                事件 {side.event.kind}
-                                {side.event.line != null &&
-                                  ` · 第 ${side.event.line} 行`}
-                                {side.event.message &&
-                                  ` · ${side.event.message}`}
-                              </div>
-                              {side.event.stack.length > 0 && (
-                                <div className="fline">
-                                  调用链：
-                                  {side.event.stack
-                                    .map((f, fi) => (
-                                      <span key={fi} className="frame-chip">
-                                        {f.name}@第{f.line}行
-                                      </span>
-                                    ))}
-                                </div>
-                              )}
-                              {side.event.stack.length > 0 && (
-                                <div className="fline">
-                                  当前帧变量：
-                                  {side.event.stack[
-                                    side.event.stack.length - 1
-                                  ].locals
-                                    .map((v) => `${v.name}=${v.value.display}`)
-                                    .join("，") || "（无局部变量）"}
-                                </div>
-                              )}
-                              {side.event.output && (
-                                <pre className="output">
-                                  {side.event.output}
-                                </pre>
-                              )}
-                            </>
-                          ) : (
-                            <div className="fline waiting-note">
-                              （等待：该侧尚未执行到对应位置，未来事件不计入比较）
-                            </div>
-                          )}
-                        </div>
-                      )
-                    )}
-                  </>
-                )}
+                ))}
               </div>
             )}
           </section>

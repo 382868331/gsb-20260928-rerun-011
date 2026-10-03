@@ -85,9 +85,36 @@ export interface CompareResult {
   diverged: boolean;
   index: number | null;
   reason: "variables" | "output" | "kind" | "ahead" | null;
+  common: number;
   sameRevision: boolean;
   left: CompareSide;
   right: CompareSide;
+}
+
+export interface SavedComparisonSummary {
+  id: string;
+  created_at: number | null;
+  name: string | null;
+  leftId: string;
+  rightId: string;
+  leftBoundary: number;
+  rightBoundary: number;
+  status: CompareResult["status"] | null;
+  leftName: string | null;
+  rightName: string | null;
+  leftHash: string | null;
+  rightHash: string | null;
+}
+
+export interface SavedComparison {
+  id: string;
+  created_at: number;
+  name: string;
+  left_id: string;
+  right_id: string;
+  left_boundary: number;
+  right_boundary: number;
+  result: CompareResult;
 }
 
 export interface MigrationCandidate {
@@ -165,6 +192,21 @@ export const api = {
       `/api/sessions/${id}/compare/${otherId}${query ? `?${query}` : ""}`
     );
   },
+  saveCompare: (
+    id: string,
+    otherId: string,
+    body: { leftBoundary?: number; rightBoundary?: number; name?: string }
+  ) =>
+    request<SavedComparison>(`/api/sessions/${id}/compare/${otherId}/save`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  listComparisons: () =>
+    request<{ comparisons: SavedComparisonSummary[] }>("/api/comparisons"),
+  getComparison: (id: string) =>
+    request<SavedComparison>(`/api/comparisons/${id}`),
+  deleteComparison: (id: string) =>
+    request<{ ok: boolean }>(`/api/comparisons/${id}`, { method: "DELETE" }),
   step: (id: string, mode: "into" | "over") =>
     request<SessionState>(`/api/sessions/${id}/step`, {
       method: "POST",

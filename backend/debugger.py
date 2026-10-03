@@ -11,6 +11,7 @@ from .minilang.lexer import LexError
 from .minilang.parser import ParseError
 
 SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
+COMPARISONS_DIR = Path(__file__).resolve().parent / "comparisons"
 
 
 class SourceError(Exception):
@@ -355,6 +356,7 @@ class DebugSession:
             "diverged": False,
             "index": None,
             "reason": None,
+            "common": 0,
             "sameRevision": self.source_hash == other.source_hash,
             "left": {
                 "id": self.id,
@@ -422,6 +424,7 @@ class DebugSession:
                 "diverged": True,
                 "index": i,
                 "reason": reason,
+                "common": i,
             })
             result["left"]["event"] = brief(self, left_events[i])
             result["right"]["event"] = brief(other, right_events[i])
@@ -442,6 +445,7 @@ class DebugSession:
                 "status": "ahead",
                 "reason": "ahead",
                 "index": common,
+                "common": common,
             })
             representative = first_line_event(longer_events, common)
             longer_side["event"] = brief(
@@ -456,6 +460,7 @@ class DebugSession:
             result["left"]["terminal"] and result["right"]["terminal"]
         ):
             result["status"] = "waiting"
+        result["common"] = common
         return result
 
     # ---- state ----
@@ -567,12 +572,100 @@ class DebugSession:
         return saved
 
 
+class ComparisonStore:
+    """Persists saved branch comparisons as self-contained work results.
+
+    Each record pins both sides' program revision hashes, the chosen pause
+    boundaries, the cursors at save time and the full comparison outcome
+    (first divergence, call stacks, variable values, outputs). Later
+    stepping, continuing, restarting or even deleting a branch never
+    rewrites a saved record, so it can be reopened and audited as-is.
+    """
+
+    def __init__(self, directory: Path = COMPARISONS_DIR):
+        self.directory = directory
+
+    def _path(self, comparison_id: str) -> Path:
+        return self.directory / f"{comparison_id}.json"
+
+    def save(
+        self,
+        left: DebugSession,
+        right: DebugSession,
+        left_boundary: int | None = None,
+        right_boundary: int | None = None,
+        name: str | None = None,
+    ) -> dict:
+        # Compute once, then freeze: the stored result is a snapshot and
+        # is never recomputed against the live branches afterwards.
+        result = left.compare(
+            right, left_boundary=left_boundary, right_boundary=right_boundary
+        )
+        record = {
+            "id": uuid.uuid4().hex[:12],
+            "created_at": time.time(),
+            "name": name or f"{left.name} vs {right.name}",
+            "left_id": left.id,
+            "right_id": right.id,
+            "left_boundary": result["left"]["boundary"],
+            "right_boundary": result["right"]["boundary"],
+            "result": result,
+        }
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self._path(record["id"]).write_text(
+            json.dumps(record, ensure_ascii=False, indent=2)
+        )
+        return record
+
+    @staticmethod
+    def _summary(record: dict) -> dict:
+        result = record.get("result", {})
+        return {
+            "id": record["id"],
+            "created_at": record.get("created_at"),
+            "name": record.get("name"),
+            "leftId": record.get("left_id"),
+            "rightId": record.get("right_id"),
+            "leftBoundary": record.get("left_boundary"),
+            "rightBoundary": record.get("right_boundary"),
+            "status": result.get("status"),
+            "leftName": result.get("left", {}).get("name"),
+            "rightName": result.get("right", {}).get("name"),
+            "leftHash": result.get("left", {}).get("sourceHash"),
+            "rightHash": result.get("right", {}).get("sourceHash"),
+        }
+
+    def list(self) -> list[dict]:
+        if not self.directory.exists():
+            return []
+        saved = []
+        for path in sorted(self.directory.glob("*.json")):
+            try:
+                record = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            saved.append(self._summary(record))
+        saved.sort(key=lambda item: item.get("created_at") or 0)
+        return saved
+
+    def get(self, comparison_id: str) -> dict:
+        return json.loads(self._path(comparison_id).read_text())
+
+    def delete(self, comparison_id: str) -> None:
+        path = self._path(comparison_id)
+        if path.exists():
+            path.unlink()
+
+
 class SessionStore:
+
+
     """Keeps live sessions in memory and persists them on every mutation."""
 
     def __init__(self, directory: Path = SESSIONS_DIR):
         self.directory = directory
         self.sessions: dict[str, DebugSession] = {}
+        self.comparisons = ComparisonStore()
 
     def create(self, source: str) -> DebugSession:
         session = DebugSession(source)

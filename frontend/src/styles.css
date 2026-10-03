@@ -124,3 +124,11 @@ aside {
   background: #2a2c34; border-radius: 4px; color: #9ecbff;
   font-family: ui-monospace, monospace;
 }
+.compare-actions { margin-bottom: 6px; }
+.saved-view {
+  border: 1px solid #4a5a78; border-radius: 6px; padding: 6px 8px;
+  margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px;
+}
+.saved-view .fname { display: flex; justify-content: space-between; align-items: center; }
+.saved-list { margin-top: 8px; border-top: 1px solid #3a3b42; padding-top: 6px; }
+.saved-list h3 { margin: 4px 0; font-size: 12px; color: #999; }

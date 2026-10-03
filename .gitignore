@@ -7,4 +7,5 @@ __pycache__/
 *.pem
 *.key
 backend/sessions/
+backend/comparisons/
 frontend/dist/
