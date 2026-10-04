@@ -61,7 +61,9 @@ export default function App() {
   // instead of replacing the current session.
   const [forkMode, setForkMode] = useState(false);
   const [branches, setBranches] = useState<BranchInfo[]>([]);
-  const [compareTarget, setCompareTarget] = useState<string>("");
+  const [compareTarget, setCompareTarget] = useState<string>(() =>
+    localStorage.getItem(LS_TARGET) ?? ""
+  );
   const [compareResult, setCompareResult] = useState<CompareResult | null>(null);
   // Independently chosen saved pause boundaries for the two sides.
   // undefined = use each side's current cursor.
@@ -72,7 +74,9 @@ export default function App() {
   // Saved comparison records: reopenable work results pinned at save time.
   const [savedComparisons, setSavedComparisons] = useState<ComparisonSummary[]>([]);
   // Non-empty while a saved record (not a live comparison) is displayed.
-  const [activeComparisonId, setActiveComparisonId] = useState<string>("");
+  const [activeComparisonId, setActiveComparisonId] = useState<string>(() =>
+    localStorage.getItem(LS_COMPARISON) ?? ""
+  );
   const [compareLive, setCompareLive] = useState<{
     left: LiveSide;
     right: LiveSide;
@@ -111,28 +115,60 @@ export default function App() {
     refreshBranches();
     refreshComparisons();
     (async () => {
-      let restoredId: string | null = null;
-      const sid = localStorage.getItem(LS_SESSION);
-      if (sid) {
+      // Read every persisted choice before the first await: effects that
+      // persist state can run during the awaits and must not overwrite
+      // what we are trying to restore (the mount effect previously lost
+      // the saved comparison this way).
+      const savedSid = localStorage.getItem(LS_SESSION);
+      const cid = localStorage.getItem(LS_COMPARISON);
+      const target = localStorage.getItem(LS_TARGET);
+      try {
+        if (cid) {
+          const saved = await api.getComparison(cid);
+          const result = saved.record.result;
+          // Restore a live session belonging to one side of the pinned
+          // comparison so the record opens at its original viewpoint.
+          let sessionId = savedSid ?? undefined;
+          if (!sessionId || savedSid === result.right.id) {
+            sessionId = result.left.id;
+          }
+          let state: SessionState | null = null;
+          try {
+            state = await api.get(sessionId);
+          } catch {
+            try {
+              state = await api.get(result.right.id);
+              sessionId = result.right.id;
+            } catch {
+              state = null;
+            }
+          }
+          if (state) {
+            setSession(state);
+            setSource(state.source);
+          }
+          setCompareResult(result);
+          setCompareLive(saved.live);
+          setActiveComparisonId(cid);
+          const otherId =
+            sessionId === result.left.id ? result.right.id : result.left.id;
+          setCompareTarget(otherId);
+          setLeftBoundary(result.left.boundary);
+          setRightBoundary(result.right.boundary);
+          return;
+        }
+      } catch {
+        localStorage.removeItem(LS_COMPARISON);
+      }
+      if (savedSid) {
         try {
-          const state = await api.get(sid);
+          const state = await api.get(savedSid);
           setSession(state);
           setSource(state.source);
-          restoredId = state.id;
         } catch {
           localStorage.removeItem(LS_SESSION);
         }
       }
-      const cid = localStorage.getItem(LS_COMPARISON);
-      if (cid) {
-        try {
-          await openComparison(cid, restoredId ?? undefined);
-          return;
-        } catch {
-          localStorage.removeItem(LS_COMPARISON);
-        }
-      }
-      const target = localStorage.getItem(LS_TARGET);
       if (target) setCompareTarget(target);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -316,6 +352,13 @@ export default function App() {
         return state;
       })
     );
+    // Switching branches never closes a pinned record. If the newly
+    // selected branch is the comparison's other side, point the target
+    // back at the opposite side so both branches stay in view.
+    if (activeComparisonId && compareResult && compareTarget === id) {
+      const other = compareResult.left.id === id ? compareResult.right : compareResult.left;
+      setCompareTarget(other.id);
+    }
   }
 
   async function runCompare() {
@@ -366,13 +409,35 @@ export default function App() {
     try {
       const saved = await api.getComparison(cid);
       const result = saved.record.result;
+      const sid = currentSessionId ?? session?.id;
+      const belongs = sid === result.left.id || sid === result.right.id;
+      let activeSid = sid;
+      if (!belongs) {
+        try {
+          const leftState = await api.get(result.left.id);
+          setSession(leftState);
+          setSource(leftState.source);
+          activeSid = leftState.id;
+        } catch {
+          try {
+            const rightState = await api.get(result.right.id);
+            setSession(rightState);
+            setSource(rightState.source);
+            activeSid = rightState.id;
+          } catch {
+            activeSid = undefined;
+          }
+        }
+        refreshBranches();
+      }
       setCompareResult(result);
       setCompareLive(saved.live);
       setActiveComparisonId(cid);
-      const sid = currentSessionId ?? session?.id;
-      const other =
-        result.left.id === sid ? result.right.id : result.left.id;
-      setCompareTarget(other);
+      if (activeSid !== undefined) {
+        const other =
+          result.left.id === activeSid ? result.right.id : result.left.id;
+        setCompareTarget(other);
+      }
       setLeftBoundary(result.left.boundary);
       setRightBoundary(result.right.boundary);
     } catch (e) {
