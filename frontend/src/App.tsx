@@ -108,14 +108,19 @@ export default function App() {
 
   useEffect(() => {
     // 页面重开：恢复上次的调试会话与比较选择。
+    // 所有本地键必须在第一个 await 之前同步读出：挂载阶段后面的
+    // 写入 effect 会在 await 期间用初始空值覆盖 localStorage，
+    // 晚读就会丢掉上次查看的比较（与会话目标）。
+    const savedSessionId = localStorage.getItem(LS_SESSION);
+    const savedComparisonId = localStorage.getItem(LS_COMPARISON);
+    const savedTarget = localStorage.getItem(LS_TARGET);
     refreshBranches();
     refreshComparisons();
     (async () => {
       let restoredId: string | null = null;
-      const sid = localStorage.getItem(LS_SESSION);
-      if (sid) {
+      if (savedSessionId) {
         try {
-          const state = await api.get(sid);
+          const state = await api.get(savedSessionId);
           setSession(state);
           setSource(state.source);
           restoredId = state.id;
@@ -123,17 +128,15 @@ export default function App() {
           localStorage.removeItem(LS_SESSION);
         }
       }
-      const cid = localStorage.getItem(LS_COMPARISON);
-      if (cid) {
+      if (savedComparisonId) {
         try {
-          await openComparison(cid, restoredId ?? undefined);
+          await openComparison(savedComparisonId, restoredId ?? undefined);
           return;
         } catch {
           localStorage.removeItem(LS_COMPARISON);
         }
       }
-      const target = localStorage.getItem(LS_TARGET);
-      if (target) setCompareTarget(target);
+      if (savedTarget) setCompareTarget(savedTarget);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
