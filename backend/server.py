@@ -46,6 +46,14 @@ class ForkBody(BaseModel):
     name: str | None = None
     breakpoints: list[int] = []
     bpMigrations: list[dict] = []
+    atCursor: int | None = None
+
+
+class DivergenceBody(BaseModel):
+    variables: list[str] | None = None  # None = 观察全部变量
+    output: bool = True
+    leftBudget: int | None = None
+    rightBudget: int | None = None
 
 
 def _get(session_id: str):
@@ -117,12 +125,31 @@ def fork(session_id: str, body: ForkBody):
             name=body.name,
             breakpoints=body.breakpoints,
             bp_migrations=body.bpMigrations,
+            at_cursor=body.atCursor,
         )
     except SourceError as exc:
         # A failed experiment edit never touches any existing branch.
         raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     store.register(branch)
     return branch.state()
+
+
+@app.post("/api/sessions/{session_id}/divergence/{other_id}")
+def locate_divergence(session_id: str, other_id: str, body: DivergenceBody):
+    left = _get(session_id)
+    right = _get(other_id)
+    try:
+        return left.locate_divergence(
+            right,
+            variables=body.variables,
+            watch_output=body.output,
+            left_budget=body.leftBudget,
+            right_budget=body.rightBudget,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/sessions/{session_id}/pause-boundaries")

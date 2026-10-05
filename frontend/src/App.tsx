@@ -6,6 +6,7 @@ import {
   PauseBoundary,
   CompareResult,
   ComparisonSummary,
+  DivergenceResult,
   LiveSide,
   MigrationPreview,
   SessionState,
@@ -38,6 +39,13 @@ const COMPARE_STATUS_LABEL: Record<string, string> = {
   waiting: "等待",
   ahead: "一侧先行",
   diverged: "首次不同",
+};
+
+const DIVERGENCE_STATUS_LABEL: Record<string, string> = {
+  diverged: "已定位到最早分歧",
+  identical: "观察范围内完全一致",
+  unmatched: "对应部分一致，但存在无法对应的位置",
+  inconclusive: "预算不足，已探索范围内未发现分歧",
 };
 
 // 页面重开后恢复上次会话与比较选择的本地键。
@@ -81,6 +89,12 @@ export default function App() {
     left: LiveSide;
     right: LiveSide;
   } | null>(null);
+  // 语义分歧定位：观察项、两侧各自的执行预算与定位结果。
+  const [divVariables, setDivVariables] = useState("");
+  const [divWatchOutput, setDivWatchOutput] = useState(true);
+  const [divLeftBudget, setDivLeftBudget] = useState("");
+  const [divRightBudget, setDivRightBudget] = useState("");
+  const [divResult, setDivResult] = useState<DivergenceResult | null>(null);
 
   const dirty = useMemo(
     () => session !== null && source !== session.source,
@@ -464,6 +478,50 @@ export default function App() {
     setActiveComparisonId("");
     setCompareLive(null);
     runCompare();
+  }
+
+  async function runDivergence() {
+    if (!session || !compareTarget) return;
+    setError("");
+    try {
+      const variables = divVariables
+        .split(/[,，\s]+/)
+        .map((v) => v.trim())
+        .filter(Boolean);
+      const parseBudget = (text: string) =>
+        text.trim() === "" ? null : Math.max(0, Number(text) || 0);
+      setDivResult(
+        await api.locateDivergence(session.id, compareTarget, {
+          variables: variables.length > 0 ? variables : null,
+          output: divWatchOutput,
+          leftBudget: parseBudget(divLeftBudget),
+          rightBudget: parseBudget(divRightBudget),
+        })
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function forkFromDivergence(side: "left" | "right") {
+    if (!divResult?.divergence) return;
+    setError("");
+    try {
+      const site = divResult.divergence[side];
+      // 从分歧位置派生调查分支：原分支的执行与记录保持不变。
+      const branch = await api.fork(divResult[side].id, {
+        name: `分歧调查@${side === "left" ? "左" : "右"}`,
+        atCursor: site.index,
+      });
+      setSession(branch);
+      setSource(branch.source);
+      setNotice(
+        `已从分歧位置（事件 ${site.index}）派生调查分支，原分支现场未改动。`
+      );
+      refreshBranches();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   }
 
   async function chooseCompareTarget(id: string) {
@@ -921,6 +979,193 @@ export default function App() {
                         </div>
                       )
                     )}
+                  </>
+                )}
+              </div>
+            )}
+          </section>
+
+          <section className="panel">
+            <h2>语义分歧定位</h2>
+            <div className="compare-controls">
+              <input
+                className="text-input"
+                value={divVariables}
+                onChange={(e) => setDivVariables(e.target.value)}
+                placeholder="观察变量（逗号分隔，空=全部）"
+              />
+              <label className="check-label">
+                <input
+                  type="checkbox"
+                  checked={divWatchOutput}
+                  onChange={(e) => setDivWatchOutput(e.target.checked)}
+                />
+                比较输出
+              </label>
+            </div>
+            <div className="compare-controls">
+              <input
+                className="text-input"
+                value={divLeftBudget}
+                onChange={(e) => setDivLeftBudget(e.target.value)}
+                placeholder="本侧执行预算（空=不限）"
+              />
+              <input
+                className="text-input"
+                value={divRightBudget}
+                onChange={(e) => setDivRightBudget(e.target.value)}
+                placeholder="对侧执行预算（空=不限）"
+              />
+              <button
+                onClick={runDivergence}
+                disabled={!session || !compareTarget}
+                title="在各自预算内按语义对应关系寻找最早分歧"
+              >
+                定位分歧
+              </button>
+            </div>
+            {divResult && (
+              <div className="compare-result">
+                <div className="fname">
+                  {DIVERGENCE_STATUS_LABEL[divResult.status] ??
+                    divResult.status}
+                </div>
+                <div className="fline">
+                  已探索：本侧 {divResult.explored.left.steps}/
+                  {divResult.explored.left.totalSteps} 步
+                  {divResult.explored.left.fullyExplored
+                    ? "（已穷尽）"
+                    : "（预算截断）"}
+                  ，对侧 {divResult.explored.right.steps}/
+                  {divResult.explored.right.totalSteps} 步
+                  {divResult.explored.right.fullyExplored
+                    ? "（已穷尽）"
+                    : "（预算截断）"}
+                  ，成功对应 {divResult.matchedPairs} 步
+                </div>
+                {divResult.status === "inconclusive" && (
+                  <div className="empty">
+                    预算内已对应的部分一致；预算之外尚未探索，
+                    不能据此宣称不存在分歧——可提高预算后重试。
+                  </div>
+                )}
+                {divResult.status === "unmatched" && (
+                  <div className="empty">
+                    可对应的部分一致，但以下已执行位置在另一侧没有
+                    对应物（循环多一次、递归更深或一侧提前结束），
+                    它们不会被当成相同位置。
+                  </div>
+                )}
+                {divResult.unmatched.leftCount +
+                  divResult.unmatched.rightCount >
+                  0 && (
+                  <div className="unmatched">
+                    {(["left", "right"] as const).map((side) => {
+                      const items = divResult.unmatched[side];
+                      const count =
+                        side === "left"
+                          ? divResult.unmatched.leftCount
+                          : divResult.unmatched.rightCount;
+                      if (count === 0) return null;
+                      return (
+                        <div key={side} className="fline">
+                          {divResult[side].name}：{count} 个无法对应的位置
+                          {items.map((e) => (
+                            <span key={e.index} className="frame-chip">
+                              {e.kind}
+                              {e.line != null && `@第${e.line}行`}
+                              {e.message && ` ${e.message}`}
+                            </span>
+                          ))}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {divResult.divergence && (
+                  <>
+                    <div>
+                      最早分歧：第 {divResult.divergence.pairIndex}{" "}
+                      个对应步（
+                      {divResult.divergence.reason === "output"
+                        ? "输出不同"
+                        : "变量值不同"}
+                      ）
+                    </div>
+                    {divResult.divergence.variables.length > 0 && (
+                      <div className="fline">
+                        不同变量：
+                        {divResult.divergence.variables
+                          .map(
+                            (v) =>
+                              `${v.name}: ${v.left ?? "（无）"} ↔ ${v.right ?? "（无）"}`
+                          )
+                          .join("，")}
+                      </div>
+                    )}
+                    {(["left", "right"] as const).map((side) => {
+                      const ev = divResult.divergence![side];
+                      const ctx = divResult.divergence!.context[side];
+                      return (
+                        <div key={side} className="compare-side">
+                          <div className="fname">
+                            {divResult[side].name} · 修订{" "}
+                            {divResult[side].sourceHash.slice(0, 6)}
+                          </div>
+                          <div className="fline">
+                            事件 {ev.index} · {ev.kind}
+                            {ev.line != null && ` · 第 ${ev.line} 行`}
+                            {ev.message && ` · ${ev.message}`}
+                          </div>
+                          {ev.stack.length > 0 && (
+                            <div className="fline">
+                              调用链：
+                              {ev.stack.map((f, fi) => (
+                                <span key={fi} className="frame-chip">
+                                  {f.name}@第{f.line}行
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          {ev.stack.length > 0 && (
+                            <div className="fline">
+                              当前帧变量：
+                              {ev.stack[ev.stack.length - 1].locals
+                                .map((v) => `${v.name}=${v.value.display}`)
+                                .join("，") || "（无局部变量）"}
+                            </div>
+                          )}
+                          <div className="fline">
+                            分歧前：
+                            {ctx.before.length === 0 && "（无）"}
+                            {ctx.before.map((e) => (
+                              <span key={e.index} className="frame-chip">
+                                第{e.line}行
+                                {e.stack.length > 0 &&
+                                  `(${e.stack[e.stack.length - 1].name})`}
+                              </span>
+                            ))}
+                          </div>
+                          <div className="fline">
+                            分歧后：
+                            {ctx.after.length === 0 && "（无）"}
+                            {ctx.after.map((e) => (
+                              <span key={e.index} className="frame-chip">
+                                第{e.line}行
+                                {e.stack.length > 0 &&
+                                  `(${e.stack[e.stack.length - 1].name})`}
+                              </span>
+                            ))}
+                          </div>
+                          <button
+                            className="link-btn"
+                            onClick={() => forkFromDivergence(side)}
+                          >
+                            从此分歧位置派生调查分支
+                          </button>
+                        </div>
+                      );
+                    })}
                   </>
                 )}
               </div>

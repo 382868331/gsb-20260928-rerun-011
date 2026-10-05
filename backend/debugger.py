@@ -217,6 +217,7 @@ class DebugSession:
         name: str | None = None,
         breakpoints: list[int] | None = None,
         bp_migrations: list[dict] | None = None,
+        at_cursor: int | None = None,
     ) -> "DebugSession":
         """Derive an independent experiment branch from the current pause.
 
@@ -227,18 +228,24 @@ class DebugSession:
         every existing branch untouched) and the branch starts from the
         top with the explicitly confirmed breakpoints; the confirmed
         old->new line mapping is recorded so it survives save/reopen.
+        at_cursor pins the branch to a specific already-recorded position
+        (e.g. a divergence site reported by locate_divergence) so a new
+        investigation can start exactly there; the parent and every
+        sibling keep their own cursor untouched.
         """
+        if at_cursor is not None and not -1 <= at_cursor <= len(self.events) - 1:
+            raise ValueError("派生位置不在已记录的执行范围内")
         new_source = self.source if source is None else source
         if source_hash(new_source) == self.source_hash:
             branch = DebugSession(
                 self.source,
                 name=name,
                 parent_id=self.id,
-                fork_cursor=self.cursor,
+                fork_cursor=at_cursor if at_cursor is not None else self.cursor,
                 bp_migrations=bp_migrations,
             )
             branch.breakpoints = set(self.breakpoints)
-            branch.cursor = self.cursor
+            branch.cursor = at_cursor if at_cursor is not None else self.cursor
             return branch
         # Compile fully before the branch object exists; a failed edit
         # therefore cannot affect this session or any sibling branch.
@@ -457,6 +464,216 @@ class DebugSession:
             result["left"]["terminal"] and result["right"]["terminal"]
         ):
             result["status"] = "waiting"
+        return result
+
+    # ---- semantic divergence localization ----
+
+    def _correspondence_key(self, event: dict) -> tuple:
+        """Semantic identity of an execution step, stable across revisions.
+
+        A line event is identified by the call path (frame names from the
+        program root) and the normalized statement text — never by step
+        count or raw line number, so extra loop iterations, changed
+        recursion depth or inserted lines cannot shift the alignment.
+        The i-th occurrence of a key on one side corresponds to the i-th
+        occurrence on the other; occurrences without a counterpart are
+        unmatched and must never be reported as "the same position".
+        """
+        if event["kind"] == "line":
+            path = tuple(frame["name"] for frame in event.get("stack", []))
+            text = _normalize(_line_text(self.source.splitlines(), event.get("line") or 0))
+            return ("line", path, text)
+        return ("terminal", event["kind"])
+
+    def _explored_steps(self, budget: int | None):
+        """Pause steps within the exploration budget.
+
+        The terminal error/end event joins only when the budget covers
+        every pause step; otherwise the exploration stops mid-trace and
+        the caller must report the explored range instead of claiming
+        anything about the unexplored tail.
+        """
+        line_events = [e for e in self.events if e["kind"] == "line"]
+        total = len(line_events)
+        if budget is None or budget >= total:
+            steps = list(line_events)
+            last = self.events[-1]
+            if last["kind"] in ("error", "end"):
+                steps.append(last)
+            return steps, total, True
+        return line_events[:budget], total, False
+
+    @staticmethod
+    def _watch_fact(event: dict, variables: list[str] | None, watch_output: bool) -> dict:
+        """Watched facts of one step: cumulative output and/or variables.
+
+        Variable lookup follows the language's scoping (innermost frame
+        wins). variables=None watches every local; a listed name that is
+        absent on both sides simply never differs.
+        """
+        fact: dict = {}
+        if watch_output:
+            fact["output"] = event.get("output", "")
+        values: dict[str, str] = {}
+        for frame in event.get("stack", []):
+            for var in frame["locals"]:
+                values[var["name"]] = var["value"]["display"]
+        if variables is not None:
+            values = {k: v for k, v in values.items() if k in variables}
+        fact["variables"] = values
+        if event["kind"] in ("error", "end"):
+            fact["message"] = event.get("message")
+        return fact
+
+    def _brief(self, event: dict) -> dict:
+        return {
+            "index": event["index"],
+            "kind": event["kind"],
+            "line": event.get("line"),
+            "sourceHash": self.source_hash,
+            "output": event.get("output", ""),
+            "stack": event.get("stack", []),
+            "message": event.get("message"),
+        }
+
+    def _context_around(self, event: dict, radius: int = 3) -> dict:
+        """Pause steps immediately before/after event in this trace.
+
+        Lets the user inspect the call sites surrounding a divergence;
+        this is a read-only view and never moves the session cursor.
+        """
+        line_events = [e for e in self.events if e["kind"] == "line"]
+        pos = next(
+            (i for i, e in enumerate(line_events) if e["index"] == event["index"]),
+            None,
+        )
+        if pos is None:
+            return {"before": [], "after": []}
+        return {
+            "before": [self._brief(e) for e in line_events[max(0, pos - radius):pos]],
+            "after": [self._brief(e) for e in line_events[pos + 1:pos + 1 + radius]],
+        }
+
+    def locate_divergence(
+        self,
+        other: "DebugSession",
+        variables: list[str] | None = None,
+        watch_output: bool = True,
+        left_budget: int | None = None,
+        right_budget: int | None = None,
+    ) -> dict:
+        """Find the earliest corresponding-but-different execution position.
+
+        Both sides are explored within their own budgets. Steps are
+        paired by semantic correspondence (call path + statement text +
+        occurrence ordinal), not by step count: a loop running one extra
+        iteration or deeper recursion only adds unmatched occurrences on
+        that side, and a side that ends early leaves its terminal event
+        unmatched. Unmatched positions are reported as unmatched — never
+        as agreement. When a budget cuts the exploration short and no
+        divergence was found, the result is "inconclusive" with the
+        explored range preserved, not a claim that no divergence exists.
+        """
+        for budget in (left_budget, right_budget):
+            if budget is not None and (not isinstance(budget, int) or budget < 0):
+                raise ValueError("执行预算必须是非负整数")
+
+        left_steps, left_total, left_full = self._explored_steps(left_budget)
+        right_steps, right_total, right_full = other._explored_steps(right_budget)
+
+        def group(session, steps):
+            grouped: dict[tuple, list[dict]] = {}
+            for event in steps:
+                grouped.setdefault(session._correspondence_key(event), []).append(event)
+            return grouped
+
+        left_groups = group(self, left_steps)
+        right_groups = group(other, right_steps)
+
+        pairs = []
+        unmatched_left: list[dict] = []
+        unmatched_right: list[dict] = []
+        for key, left_list in left_groups.items():
+            right_list = right_groups.get(key, [])
+            common = min(len(left_list), len(right_list))
+            pairs.extend(zip(left_list[:common], right_list[:common]))
+            unmatched_left.extend(left_list[common:])
+        for key, right_list in right_groups.items():
+            left_list = left_groups.get(key, [])
+            unmatched_right.extend(right_list[len(left_list):])
+        # Earliest divergence = first differing pair in execution order.
+        pairs.sort(key=lambda pair: pair[0]["index"])
+        unmatched_left.sort(key=lambda e: e["index"])
+        unmatched_right.sort(key=lambda e: e["index"])
+
+        result = {
+            "status": "identical",
+            "watch": {"variables": variables, "output": watch_output},
+            "budget": {"left": left_budget, "right": right_budget},
+            "explored": {
+                "left": {
+                    "steps": len(left_steps), "totalSteps": left_total,
+                    "fullyExplored": left_full,
+                },
+                "right": {
+                    "steps": len(right_steps), "totalSteps": right_total,
+                    "fullyExplored": right_full,
+                },
+            },
+            "matchedPairs": len(pairs),
+            "left": {"id": self.id, "name": self.name, "sourceHash": self.source_hash},
+            "right": {"id": other.id, "name": other.name, "sourceHash": other.source_hash},
+            "divergence": None,
+            "unmatched": {
+                "left": [self._brief(e) for e in unmatched_left[:20]],
+                "right": [other._brief(e) for e in unmatched_right[:20]],
+                "leftCount": len(unmatched_left),
+                "rightCount": len(unmatched_right),
+            },
+        }
+
+        for pair_index, (left_event, right_event) in enumerate(pairs):
+            left_fact = self._watch_fact(left_event, variables, watch_output)
+            right_fact = other._watch_fact(right_event, variables, watch_output)
+            if left_fact == right_fact:
+                continue
+            if watch_output and left_fact["output"] != right_fact["output"]:
+                reason = "output"
+                var_diffs = []
+            else:
+                reason = "variables"
+                names = set(left_fact["variables"]) | set(right_fact["variables"])
+                var_diffs = [
+                    {
+                        "name": name,
+                        "left": left_fact["variables"].get(name),
+                        "right": right_fact["variables"].get(name),
+                    }
+                    for name in sorted(names)
+                    if left_fact["variables"].get(name)
+                    != right_fact["variables"].get(name)
+                ]
+            result["status"] = "diverged"
+            result["divergence"] = {
+                "pairIndex": pair_index,
+                "reason": reason,
+                "variables": var_diffs,
+                "left": self._brief(left_event),
+                "right": other._brief(right_event),
+                "context": {
+                    "left": self._context_around(left_event),
+                    "right": other._context_around(right_event),
+                },
+            }
+            return result
+
+        if unmatched_left or unmatched_right:
+            # Corresponding prefix agrees, but some executed positions
+            # (extra iterations, deeper recursion, an early exit) have no
+            # counterpart on the other side — reported, not equated.
+            result["status"] = "unmatched"
+        elif not (left_full and right_full):
+            result["status"] = "inconclusive"
         return result
 
     # ---- state ----

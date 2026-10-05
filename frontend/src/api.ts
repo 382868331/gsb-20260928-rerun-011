@@ -114,6 +114,46 @@ export interface LiveSide {
   status?: string;
 }
 
+export interface DivergenceEvent {
+  index: number;
+  kind: string;
+  line: number | null;
+  sourceHash: string;
+  output: string;
+  stack: FrameSnapshot[];
+  message: string | null;
+}
+
+export interface DivergenceResult {
+  status: "diverged" | "identical" | "unmatched" | "inconclusive";
+  watch: { variables: string[] | null; output: boolean };
+  budget: { left: number | null; right: number | null };
+  explored: {
+    left: { steps: number; totalSteps: number; fullyExplored: boolean };
+    right: { steps: number; totalSteps: number; fullyExplored: boolean };
+  };
+  matchedPairs: number;
+  left: { id: string; name: string; sourceHash: string };
+  right: { id: string; name: string; sourceHash: string };
+  divergence: {
+    pairIndex: number;
+    reason: "output" | "variables";
+    variables: { name: string; left: string | null; right: string | null }[];
+    left: DivergenceEvent;
+    right: DivergenceEvent;
+    context: {
+      left: { before: DivergenceEvent[]; after: DivergenceEvent[] };
+      right: { before: DivergenceEvent[]; after: DivergenceEvent[] };
+    };
+  } | null;
+  unmatched: {
+    left: DivergenceEvent[];
+    right: DivergenceEvent[];
+    leftCount: number;
+    rightCount: number;
+  };
+}
+
 export interface SavedComparison {
   record: {
     id: string;
@@ -175,6 +215,7 @@ export const api = {
       name?: string;
       breakpoints?: number[];
       bpMigrations?: BpMigration[];
+      atCursor?: number;
     }
   ) =>
     request<SessionState>(`/api/sessions/${id}/fork`, {
@@ -218,6 +259,20 @@ export const api = {
   },
   listComparisons: () =>
     request<{ comparisons: ComparisonSummary[] }>("/api/comparisons"),
+  locateDivergence: (
+    id: string,
+    otherId: string,
+    body: {
+      variables?: string[] | null;
+      output?: boolean;
+      leftBudget?: number | null;
+      rightBudget?: number | null;
+    }
+  ) =>
+    request<DivergenceResult>(`/api/sessions/${id}/divergence/${otherId}`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   getComparison: (id: string) =>
     request<SavedComparison>(`/api/comparisons/${id}`),
   deleteComparison: (id: string) =>

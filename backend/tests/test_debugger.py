@@ -36,6 +36,40 @@ let z = wrapper(0)
 print(z)
 """
 
+BASE_CASE_A = """fun fact(n)
+    if n <= 1
+        return 1
+    return n * fact(n - 1)
+let r = fact(3)
+print(r)
+"""
+
+# 仅递归基例不同：return 2 而非 return 1。
+BASE_CASE_B = BASE_CASE_A.replace("return 1", "return 2")
+
+LOOP_N_A = """let n = 3
+let i = 0
+let total = 0
+while i < n
+    total = total + i
+    i = i + 1
+print(total)
+"""
+
+# 循环多一次：n = 4。
+LOOP_N_B = LOOP_N_A.replace("let n = 3", "let n = 4")
+
+EARLY_EXIT_A = """fun f(x)
+    let y = 10 / x
+    return y
+let a = f(1)
+let b = f(0)
+print(a + b)
+"""
+
+# 第二次调用不再触发除以零，一侧提前异常退出。
+EARLY_EXIT_B = EARLY_EXIT_A.replace("let b = f(0)", "let b = f(2)")
+
 
 def locals_of(state, frame_index=-1):
     frame = state["stack"][frame_index]
@@ -660,3 +694,144 @@ def test_saved_comparison_survives_branch_abandon(tmp_path):
     loaded = fresh_store.get(grandchild.id)
     assert loaded.parent_id == right.id
     assert loaded.source == LOOP
+
+
+def frame_names(brief):
+    return [f["name"] for f in brief["stack"]]
+
+
+def test_divergence_recursion_base_case_change():
+    left = DebugSession(BASE_CASE_A)
+    right = DebugSession(BASE_CASE_B)
+    result = left.locate_divergence(right)
+    assert result["status"] == "diverged"
+    div = result["divergence"]
+    # 最早可对应但值不同的位置：print(r)，r 已被赋为 6 vs 12。
+    assert div["left"]["line"] == 6
+    assert div["right"]["line"] == 6
+    assert div["reason"] == "variables"
+    assert {"name": "r", "left": "6", "right": "12"} in div["variables"]
+    # 基例语句文本不同，两侧各自无法对应，绝不被说成相同位置。
+    unmatched_left_lines = [e["line"] for e in result["unmatched"]["left"]]
+    unmatched_right_lines = [e["line"] for e in result["unmatched"]["right"]]
+    assert 3 in unmatched_left_lines  # return 1
+    assert 3 in unmatched_right_lines  # return 2
+    # 分歧前后的调用现场可供查看。
+    assert div["context"]["left"]["before"]
+    assert frame_names(div["left"]) == ["main"]
+
+
+def test_divergence_loop_one_extra_iteration():
+    left = DebugSession(LOOP_N_A)
+    right = DebugSession(LOOP_N_B)
+    result = left.locate_divergence(right)
+    assert result["status"] == "diverged"
+    div = result["divergence"]
+    # 最早可对应但值不同的位置：let i = 0 时 n 已经是 3 vs 4。
+    assert div["left"]["line"] == 2
+    assert {"name": "n", "left": "3", "right": "4"} in div["variables"]
+    # 只观察 total 时，分歧定位到循环结束后的 print(total)。
+    total_only = left.locate_divergence(
+        right, variables=["total"], watch_output=False
+    )
+    assert total_only["divergence"]["left"]["line"] == 7
+    assert {"name": "total", "left": "3", "right": "6"} in (
+        total_only["divergence"]["variables"]
+    )
+    # 右侧第 4 次迭代的语句没有 counterpart，列入 unmatched 而非对齐。
+    right_unmatched_texts = [
+        (e["line"], e["kind"]) for e in result["unmatched"]["right"]
+    ]
+    assert result["unmatched"]["rightCount"] == 4  # let n=4 + 第4轮三条语句
+    assert (5, "line") in right_unmatched_texts  # total = total + i
+    assert (6, "line") in right_unmatched_texts  # i = i + 1
+    # 左侧已完全探索，没有遗留。
+    assert result["explored"]["left"]["fullyExplored"]
+    assert result["explored"]["right"]["fullyExplored"]
+
+
+def test_divergence_exception_early_exit():
+    left = DebugSession(EARLY_EXIT_A)
+    right = DebugSession(EARLY_EXIT_B)
+    result = left.locate_divergence(right)
+    assert result["status"] == "diverged"
+    div = result["divergence"]
+    # 第二次调用的形参值不同：定位到 f 内部、调用现场完整。
+    assert div["left"]["line"] == 2
+    assert frame_names(div["left"]) == ["main", "f"]
+    assert {"name": "x", "left": "0", "right": "2"} in div["variables"]
+    # 左侧提前异常退出：error 终态无法对应，如实报告而非对齐。
+    left_unmatched_kinds = [e["kind"] for e in result["unmatched"]["left"]]
+    assert "error" in left_unmatched_kinds
+    # 右侧多出的后续执行同样只是 unmatched。
+    assert result["unmatched"]["rightCount"] > 0
+
+
+def test_divergence_budget_inconclusive_keeps_explored_range():
+    left = DebugSession(BASE_CASE_A)
+    right = DebugSession(BASE_CASE_B)
+    # 预算只覆盖前 3 个暂停步（三次 if 判断），分歧尚未出现。
+    result = left.locate_divergence(right, left_budget=3, right_budget=3)
+    assert result["status"] == "inconclusive"
+    assert result["divergence"] is None
+    assert result["explored"]["left"]["steps"] == 3
+    assert result["explored"]["left"]["fullyExplored"] is False
+    assert result["explored"]["left"]["totalSteps"] > 3
+    # 预算充足时同一对程序能定位到分歧，证明 inconclusive 不是"无分歧"。
+    full = left.locate_divergence(right)
+    assert full["status"] == "diverged"
+
+
+def test_divergence_identical_revisions():
+    left = DebugSession(LOOP_N_A)
+    right = DebugSession(LOOP_N_A)
+    result = left.locate_divergence(right)
+    assert result["status"] == "identical"
+    assert result["unmatched"]["leftCount"] == 0
+    assert result["unmatched"]["rightCount"] == 0
+
+
+def test_divergence_watch_selected_variables_only():
+    left = DebugSession(BASE_CASE_A)
+    right = DebugSession(BASE_CASE_B)
+    # 只看 n：两侧每层递归的 n 完全一致；剩下的文本差异如实列为 unmatched。
+    result = left.locate_divergence(
+        right, variables=["n"], watch_output=False
+    )
+    assert result["status"] == "unmatched"
+    assert result["divergence"] is None
+    # 改看 r：立即定位到 print(r) 处的值分歧。
+    result_r = left.locate_divergence(
+        right, variables=["r"], watch_output=False
+    )
+    assert result_r["status"] == "diverged"
+    assert result_r["divergence"]["variables"] == [
+        {"name": "r", "left": "6", "right": "12"}
+    ]
+
+
+def test_divergence_output_watch():
+    left = DebugSession(BASE_CASE_A)
+    right = DebugSession(BASE_CASE_B)
+    result = left.locate_divergence(
+        right, variables=[], watch_output=True
+    )
+    assert result["status"] == "diverged"
+    assert result["divergence"]["reason"] == "output"
+
+
+def test_fork_from_divergence_site_keeps_parent_untouched():
+    left = DebugSession(BASE_CASE_A)
+    right = DebugSession(BASE_CASE_B)
+    left.continue_()
+    parent_cursor = left.cursor
+    result = left.locate_divergence(right)
+    site = result["divergence"]["left"]["index"]
+    branch = left.fork(at_cursor=site, name="调查分支")
+    assert branch.cursor == site
+    assert branch.state()["line"] == result["divergence"]["left"]["line"]
+    # 原分支的执行与记录保持不变。
+    assert left.cursor == parent_cursor
+    # 派生位置必须在已记录范围内。
+    with pytest.raises(ValueError):
+        left.fork(at_cursor=len(left.events) + 10)

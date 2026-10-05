@@ -99,6 +99,11 @@ aside {
 .branch.selected { background: #34507a; }
 .migrations { margin-top: 8px; border-top: 1px solid #3a3b42; padding-top: 6px; }
 .compare-controls { display: flex; gap: 6px; margin-bottom: 8px; }
+.compare-controls .text-input {
+  flex: 1; min-width: 0; background: #17181d; color: #ddd;
+  border: 1px solid #333; border-radius: 4px; padding: 4px 6px;
+}
+.check-label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
 .compare-controls select {
   flex: 1; background: #1b1c21; color: #ddd; border: 1px solid #3a3b42;
   border-radius: 5px; padding: 4px;
