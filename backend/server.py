@@ -48,6 +48,20 @@ class ForkBody(BaseModel):
     bpMigrations: list[dict] = []
 
 
+class ForkAtBody(BaseModel):
+    index: int
+    name: str | None = None
+
+
+class DivergenceBody(BaseModel):
+    # watch: {'output': bool, 'variables': [name, ...] | None}; a
+    # missing/null variables list compares every local of every frame.
+    watch: dict | None = None
+    leftBudget: int | None = None
+    rightBudget: int | None = None
+    context: int = 3
+
+
 def _get(session_id: str):
     try:
         return store.get(session_id)
@@ -123,6 +137,32 @@ def fork(session_id: str, body: ForkBody):
         raise HTTPException(status_code=400, detail=str(exc))
     store.register(branch)
     return branch.state()
+
+
+@app.post("/api/sessions/{session_id}/fork-at")
+def fork_at(session_id: str, body: ForkAtBody):
+    session = _get(session_id)
+    try:
+        branch = session.fork_at(body.index, name=body.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    store.register(branch)
+    return branch.state()
+
+
+@app.post("/api/sessions/{session_id}/divergence/{other_id}")
+def locate_divergence(session_id: str, other_id: str, body: DivergenceBody):
+    left = _get(session_id)
+    right = _get(other_id)
+    # Pure read: exploration replays the recorded traces without moving
+    # either cursor, so both sessions and every saved record stay as-is.
+    return left.locate_divergence(
+        right,
+        watch=body.watch,
+        left_budget=body.leftBudget,
+        right_budget=body.rightBudget,
+        context=body.context,
+    )
 
 
 @app.get("/api/sessions/{session_id}/pause-boundaries")

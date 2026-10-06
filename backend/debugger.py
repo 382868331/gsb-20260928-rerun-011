@@ -255,6 +255,263 @@ class DebugSession:
         }
         return branch
 
+    def fork_at(self, index: int, name: str | None = None) -> "DebugSession":
+        """Derive an investigation branch paused exactly at the given index.
+
+        Used to continue investigating from a divergence location (or its
+        surrounding call sites). The derivation is pure: this session's
+        cursor, trace, breakpoints and persisted record are all left
+        untouched, and the new branch simply replays the same
+        deterministic trace up to the requested event.
+        """
+        if not -1 <= index <= len(self.events) - 1:
+            raise ValueError("派生位置超出已记录的执行范围")
+        branch = DebugSession(
+            self.source,
+            name=name or "调查分支",
+            parent_id=self.id,
+            fork_cursor=index,
+        )
+        branch.breakpoints = set(self.breakpoints)
+        branch.cursor = index
+        return branch
+
+    # ---- divergence localization ----
+
+    def _step_key(self, event: dict, lines: list[str]):
+        """Semantic correspondence key of one explored step.
+
+        A pause step corresponds across revisions only when it is the
+        same normalized statement text executed under the same call path
+        (function names from outermost to innermost frame). Line numbers
+        and raw step counts are deliberately excluded: inserted lines,
+        changed call depth, extra loop iterations or deeper recursion
+        must not make unrelated positions look aligned. Terminal events
+        correspond only to the same terminal kind, so an early error on
+        one side never matches a normal exit on the other.
+        """
+        if event["kind"] == "line":
+            path = tuple(frame["name"] for frame in event.get("stack", []))
+            text = _normalize(_line_text(lines, event.get("line") or 0))
+            return ("line", path, text)
+        return ("terminal", event["kind"])
+
+    def _explored_steps(self, start: int, budget: int | None):
+        """Pause steps after the given cursor, capped at the budget.
+
+        Exploration is pure replay over the recorded deterministic
+        trace; the session cursor never moves. Returns the steps and
+        whether the trace was fully consumed within the budget. A
+        terminal error/end event is appended as the final step so an
+        early exit stays a visible, comparable fact.
+        """
+        steps = []
+        i = start + 1
+        total = len(self.events)
+        while i < total:
+            event = self.events[i]
+            if event["kind"] == "line":
+                if budget is not None and len(steps) >= budget:
+                    return steps, False
+                steps.append(event)
+            i += 1
+        last = self.events[-1]
+        if last["kind"] in ("error", "end") and (not steps or steps[-1] is not last):
+            steps.append(last)
+        return steps, True
+
+    @staticmethod
+    def _watched_values(event: dict, variables: list[str]) -> dict:
+        """Resolve watched variable names against an event's stack.
+
+        Lookup follows runtime scoping (innermost frame first); a name
+        absent from every live frame is reported as None, which is a
+        real difference when the other side does have a value.
+        """
+        frames = event.get("stack", [])
+        values = {}
+        for name in variables:
+            found = None
+            for frame in reversed(frames):
+                for var in frame["locals"]:
+                    if var["name"] == name:
+                        found = var["value"]["display"]
+                        break
+                if found is not None:
+                    break
+            values[name] = found
+        return values
+
+    @staticmethod
+    def _frame_facts(event: dict) -> list:
+        return [
+            (
+                frame["name"],
+                tuple(
+                    (var["name"], var["value"]["display"])
+                    for var in frame["locals"]
+                ),
+            )
+            for frame in event.get("stack", [])
+        ]
+
+    def locate_divergence(
+        self,
+        other: "DebugSession",
+        watch: dict | None = None,
+        left_budget: int | None = None,
+        right_budget: int | None = None,
+        context: int = 3,
+    ) -> dict:
+        """Locate the earliest corresponding position where two branches differ.
+
+        Both sides are explored forward from their current pause cursor,
+        each within its own step budget. Steps are aligned semantically
+        by (call path, normalized statement text, occurrence ordinal),
+        never by raw step count, so a changed recursion base case, an
+        extra loop iteration or an early exception cannot be silently
+        aligned onto unrelated positions. Only the watched facts (the
+        specified output and/or variables) decide divergence. Positions
+        that exist on only one side are reported as non-correspondable,
+        never claimed to be equal. When a budget runs out before the
+        trace is consumed, the explored range is preserved and the
+        result is budget_exhausted rather than no-divergence.
+        """
+        watch = watch or {}
+        watch_output = bool(watch.get("output", True))
+        variables = watch.get("variables", None)  # None = compare all locals
+        if variables is not None:
+            variables = [str(v) for v in variables]
+
+        left_steps, left_full = self._explored_steps(self.cursor, left_budget)
+        right_steps, right_full = other._explored_steps(other.cursor, right_budget)
+        left_lines = self.source.splitlines()
+        right_lines = other.source.splitlines()
+
+        # Pair the k-th occurrence of each semantic key on the left with
+        # the k-th occurrence of the same key on the right.
+        right_map = {}
+        occurrence: dict = {}
+        for step in right_steps:
+            key = other._step_key(step, right_lines)
+            ordinal = occurrence.get(key, 0)
+            occurrence[key] = ordinal + 1
+            right_map[(key, ordinal)] = step
+        occurrence = {}
+        matched: list[tuple[dict, dict]] = []
+        left_only: list[dict] = []
+        for step in left_steps:
+            key = self._step_key(step, left_lines)
+            ordinal = occurrence.get(key, 0)
+            occurrence[key] = ordinal + 1
+            counterpart = right_map.get((key, ordinal))
+            if counterpart is None:
+                left_only.append(step)
+            else:
+                matched.append((step, counterpart))
+        matched_right = {id(step) for _, step in matched}
+        right_only = [s for s in right_steps if id(s) not in matched_right]
+
+        def brief(session, event):
+            return {
+                "index": event["index"],
+                "kind": event["kind"],
+                "line": event.get("line"),
+                "sourceHash": session.source_hash,
+                "output": event.get("output", ""),
+                "stack": event.get("stack", []),
+                "message": event.get("message"),
+            }
+
+        def surroundings(session, steps, pos):
+            lo = max(0, pos - context)
+            hi = min(len(steps), pos + context + 1)
+            return {
+                "before": [brief(session, s) for s in steps[lo:pos]],
+                "after": [brief(session, s) for s in steps[pos + 1:hi]],
+            }
+
+        result = {
+            "status": "equal",
+            "diverged": False,
+            "watch": {"output": watch_output, "variables": variables},
+            "matchedPairs": 0,
+            "left": {
+                "id": self.id,
+                "name": self.name,
+                "sourceHash": self.source_hash,
+                "startCursor": self.cursor,
+                "budget": left_budget,
+                "exploredSteps": len(left_steps),
+                "fullyExplored": left_full,
+            },
+            "right": {
+                "id": other.id,
+                "name": other.name,
+                "sourceHash": other.source_hash,
+                "startCursor": other.cursor,
+                "budget": right_budget,
+                "exploredSteps": len(right_steps),
+                "fullyExplored": right_full,
+            },
+            "divergence": None,
+            "unmatched": {
+                "leftCount": len(left_only),
+                "rightCount": len(right_only),
+                "leftSample": [brief(self, s) for s in left_only[:5]],
+                "rightSample": [brief(other, s) for s in right_only[:5]],
+            },
+        }
+
+        for pair_index, (left_step, right_step) in enumerate(matched):
+            reasons = []
+            variable_diff = {}
+            if watch_output and left_step.get("output", "") != right_step.get(
+                "output", ""
+            ):
+                reasons.append("output")
+            if variables is None:
+                if self._frame_facts(left_step) != self._frame_facts(right_step):
+                    reasons.append("variables")
+            elif variables:
+                left_values = self._watched_values(left_step, variables)
+                right_values = self._watched_values(right_step, variables)
+                variable_diff = {
+                    name: {"left": left_values[name], "right": right_values[name]}
+                    for name in variables
+                    if left_values[name] != right_values[name]
+                }
+                if variable_diff:
+                    reasons.append("variables")
+            result["matchedPairs"] = pair_index + 1
+            if not reasons:
+                continue
+            left_pos = left_steps.index(left_step)
+            right_pos = right_steps.index(right_step)
+            result.update({
+                "status": "diverged",
+                "diverged": True,
+                "divergence": {
+                    "pairIndex": pair_index,
+                    "reasons": reasons,
+                    "variables": variable_diff,
+                    "left": brief(self, left_step),
+                    "right": brief(other, right_step),
+                    "leftContext": surroundings(self, left_steps, left_pos),
+                    "rightContext": surroundings(other, right_steps, right_pos),
+                },
+            })
+            return result
+
+        # Every corresponding pair agreed on the watched facts. What
+        # remains decides the honest status: unexplored budget tail,
+        # non-correspondable positions, or true equality.
+        if not left_full or not right_full:
+            result["status"] = "budget_exhausted"
+        elif left_only or right_only:
+            result["status"] = "unmatched"
+        return result
+
     # ---- comparison ----
 
     @staticmethod

@@ -106,6 +106,49 @@ export interface ComparisonSummary {
   rightHash: string;
 }
 
+export interface DivergenceSide {
+  id: string;
+  name: string;
+  sourceHash: string;
+  startCursor: number;
+  budget: number | null;
+  exploredSteps: number;
+  fullyExplored: boolean;
+}
+
+export interface DivergenceInfo {
+  pairIndex: number;
+  reasons: string[];
+  variables: Record<string, { left: string | null; right: string | null }>;
+  left: CompareEvent;
+  right: CompareEvent;
+  leftContext: { before: CompareEvent[]; after: CompareEvent[] };
+  rightContext: { before: CompareEvent[]; after: CompareEvent[] };
+}
+
+export interface DivergenceResult {
+  status: "diverged" | "equal" | "unmatched" | "budget_exhausted";
+  diverged: boolean;
+  watch: { output: boolean; variables: string[] | null };
+  matchedPairs: number;
+  left: DivergenceSide;
+  right: DivergenceSide;
+  divergence: DivergenceInfo | null;
+  unmatched: {
+    leftCount: number;
+    rightCount: number;
+    leftSample: CompareEvent[];
+    rightSample: CompareEvent[];
+  };
+}
+
+export interface DivergenceRequest {
+  watch?: { output?: boolean; variables?: string[] | null };
+  leftBudget?: number | null;
+  rightBudget?: number | null;
+  context?: number;
+}
+
 export interface LiveSide {
   id: string;
   missing: boolean;
@@ -218,6 +261,16 @@ export const api = {
   },
   listComparisons: () =>
     request<{ comparisons: ComparisonSummary[] }>("/api/comparisons"),
+  locateDivergence: (id: string, otherId: string, body: DivergenceRequest) =>
+    request<DivergenceResult>(`/api/sessions/${id}/divergence/${otherId}`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  forkAt: (id: string, index: number, name?: string) =>
+    request<SessionState>(`/api/sessions/${id}/fork-at`, {
+      method: "POST",
+      body: JSON.stringify({ index, name }),
+    }),
   getComparison: (id: string) =>
     request<SavedComparison>(`/api/comparisons/${id}`),
   deleteComparison: (id: string) =>
